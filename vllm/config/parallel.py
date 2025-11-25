@@ -896,13 +896,24 @@ class ParallelConfig:
                 current_platform.is_cuda()
                 and current_platform.device_count() < self.world_size
             ):
+                if not ray_found:
+                    raise ValueError(
+                        "Unable to load Ray: "
+                        f"{ray_utils.ray_import_err}. Ray is "
+                        "required for multi-node inference, "
+                        "please install Ray with `pip install "
+                        "ray`."
+                    )
+                backend = "ray"
                 gpu_count = current_platform.device_count()
-                raise ValueError(
-                    f"World size ({self.world_size}) is larger than the number of "
-                    f"available GPUs ({gpu_count}) in this node. If this is "
+                logger.warning(
+                    "World size (%d) is larger than the number of "
+                    "available GPUs (%d) in this node. If this is "
                     "intentional and you are using:\n"
                     "- ray, set '--distributed-executor-backend ray'.\n"
-                    "- multiprocessing, set '--nnodes' appropriately."
+                    "- multiprocessing, set '--nnodes' appropriately.",
+                    self.world_size,
+                    gpu_count,
                 )
             elif self.data_parallel_backend == "ray":
                 logger.info(
