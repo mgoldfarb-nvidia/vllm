@@ -549,7 +549,6 @@ num2words==0.5.14
     # via -r requirements/test/cuda.in
 numba==0.65.0
     # via
-    #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
     #   librosa
 numpy==2.2.6
@@ -1204,7 +1203,6 @@ tokenizers==0.22.2
     #   transformers
 torch==2.11.0+cu130
     # via
-    #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
     #   accelerate
     #   bitsandbytes
@@ -1225,7 +1223,6 @@ torch==2.11.0+cu130
     #   xgrammar
 torchaudio==2.11.0+cu130
     # via
-    #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
     #   encodec
     #   vocos
@@ -1235,7 +1232,6 @@ torchcodec==0.14.0+cu130
     #   -r requirements/test/cuda.in
 torchvision==0.26.0+cu130
     # via
-    #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
     #   open-clip-torch
     #   segmentation-models-pytorch
