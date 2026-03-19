@@ -156,6 +156,8 @@ struct MacheteCollectiveMma {
     using ClusterShape = ClusterShape_MNK;
     using ArchTag = arch::Sm90;
     using Schedule = KernelScheduleType;
+    // Required by CUTLASS sm90_gemm_tma_warpspecialized_cooperative.hpp (IsSm120Family check)
+    using ArchTag = arch::Sm90;
   };
 
   using GmemTiledCopyA =
