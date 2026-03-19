@@ -833,7 +833,7 @@ pyarrow==23.0.0
     # via
     #   datasets
     #   genai-perf
-pyasn1==0.6.1
+pyasn1==0.6.3  # CVE-2026-30922
     # via
     #   pyasn1-modules
     #   rsa
