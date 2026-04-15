@@ -106,10 +106,12 @@ class RayDistributedExecutor(Executor):
             )
         if hasattr(self, "forward_dag") and self.forward_dag is not None:
             self.forward_dag.teardown()
-            import ray
 
+            # Use __ray_terminate__ for graceful shutdown so that atexit
+            # handlers (e.g. profiling data flushes) can run.
+            # ray.kill() sends SIGKILL which skips atexit entirely.
             for worker in self.workers:
-                ray.kill(worker)
+                worker.__ray_terminate__.remote()
             self.forward_dag = None
 
     def _configure_ray_workers_use_nsight(self, ray_remote_kwargs) -> dict[str, Any]:
