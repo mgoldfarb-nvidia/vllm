@@ -56,6 +56,24 @@ MNK_FACTORS = [
 ]
 
 
+def _reorder_gate_up_to_up_gate(
+    w: torch.Tensor,
+    w_s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Swap gate and up-projection halves along dim=1 to [up, gate] order.
+
+    The B12x kernel expects weights in [up (w3), gate (w1)] order while the
+    BF16 reference uses [gate (w1), up (w3)].  This replicates the reordering
+    done at model-load time by the FP4 layer-prep helper.
+    """
+    n = w.shape[1] // 2
+    return (
+        torch.cat([w[:, n:, :], w[:, :n, :]], dim=1),
+        torch.cat([w_s[:, n:, :], w_s[:, :n, :]], dim=1),
+    )
+
+
+
 def _process_b12x_weights(
     experts: FlashInferB12xExperts,
     w1_scale: torch.Tensor,

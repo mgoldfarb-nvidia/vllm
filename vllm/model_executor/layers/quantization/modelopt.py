@@ -52,6 +52,7 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -2425,6 +2426,24 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:
                 return self.quantized_layers[candidate]["quant_algo"].upper()
+
+        # Qwen VLM wrappers can construct the LM head under a nested vLLM
+        # prefix while ModelOpt exports the tensor names as top-level lm_head.*.
+        if prefix.endswith(".lm_head") and "lm_head" in self.quantized_layers:
+            return self.quantized_layers["lm_head"]["quant_algo"].upper()
+
+        # Qwen3.5/3.6-MoE VLM: vLLM's internal naming can be
+        # language_model.model.layers.X... while ModelOpt exports keys as
+        # model.language_model.layers.X... (swapped wrapper order). Try the
+        # swap as a direct fallback for any prefix that does not match.
+        if prefix.startswith("language_model.model."):
+            swapped = "model.language_model." + prefix[len("language_model.model.") :]
+            if swapped in self.quantized_layers:
+                return self.quantized_layers[swapped]["quant_algo"].upper()
+        elif prefix.startswith("model.language_model."):
+            swapped = "language_model.model." + prefix[len("model.language_model.") :]
+            if swapped in self.quantized_layers:
+                return self.quantized_layers[swapped]["quant_algo"].upper()
 
         # 2. Packed / fused layer lookup
         proj_name = prefix.rsplit(".", 1)[-1]
