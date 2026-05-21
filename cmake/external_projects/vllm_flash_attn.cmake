@@ -53,8 +53,34 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY FALSE)" ALL_COMPONENTS)
 install(CODE "set(OLD_CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_COMPONENTS)
 
-# Fetch the vllm-flash-attn library
-FetchContent_MakeAvailable(vllm-flash-attn)
+# Fetch the vllm-flash-attn library. Use explicit populate so we can patch the
+# vendored CMake before add_subdirectory configures it.
+FetchContent_GetProperties(vllm-flash-attn)
+if(NOT vllm-flash-attn_POPULATED)
+  FetchContent_Populate(vllm-flash-attn)
+endif()
+
+set(_VLLM_CUDA_MIN_ARCH)
+if(DEFINED VLLM_CUDA_MIN_ARCH)
+  set(_VLLM_CUDA_MIN_ARCH "${VLLM_CUDA_MIN_ARCH}")
+elseif(DEFINED ENV{VLLM_CUDA_MIN_ARCH})
+  set(_VLLM_CUDA_MIN_ARCH "$ENV{VLLM_CUDA_MIN_ARCH}")
+endif()
+
+if(_VLLM_CUDA_MIN_ARCH AND "${_VLLM_CUDA_MIN_ARCH}" VERSION_GREATER_EQUAL "10.0")
+  set(_VLLM_FLASH_ATTN_CMAKELISTS "${vllm-flash-attn_SOURCE_DIR}/CMakeLists.txt")
+  file(READ "${_VLLM_FLASH_ATTN_CMAKELISTS}" _VLLM_FLASH_ATTN_CMAKE)
+  string(REPLACE
+    [[cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")]]
+    [[cuda_archs_loose_intersection(FA2_ARCHS "10.0+PTX" "${CUDA_ARCHS}")]]
+    _VLLM_FLASH_ATTN_CMAKE
+    "${_VLLM_FLASH_ATTN_CMAKE}")
+  file(WRITE "${_VLLM_FLASH_ATTN_CMAKELISTS}" "${_VLLM_FLASH_ATTN_CMAKE}")
+  message(STATUS "Patched vllm-flash-attn FA2 minimum architecture to "
+                 "${_VLLM_CUDA_MIN_ARCH}.")
+endif()
+
+add_subdirectory("${vllm-flash-attn_SOURCE_DIR}" "${vllm-flash-attn_BINARY_DIR}")
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
 # Restore the install prefix after FA's install rules
