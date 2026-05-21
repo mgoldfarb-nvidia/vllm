@@ -182,8 +182,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
   # Filter the target architectures by the supported supported archs
   # since for some files we will build for all CUDA_ARCHS.
+  if(DEFINED VLLM_CUDA_MIN_ARCH)
+    message(STATUS "CUDA minimum target architecture filter: ${VLLM_CUDA_MIN_ARCH}")
+  elseif(DEFINED ENV{VLLM_CUDA_MIN_ARCH})
+    message(STATUS "CUDA minimum target architecture filter: $ENV{VLLM_CUDA_MIN_ARCH}")
+  endif()
   cuda_archs_loose_intersection(CUDA_ARCHS
     "${CUDA_SUPPORTED_ARCHS}" "${CUDA_ARCHS}")
+  if(NOT CUDA_ARCHS)
+    message(FATAL_ERROR "No CUDA target architectures remain after applying "
+                        "the supported architecture and minimum architecture "
+                        "filters.")
+  endif()
   message(STATUS "CUDA supported target architectures: ${CUDA_ARCHS}")
 else()
   #
