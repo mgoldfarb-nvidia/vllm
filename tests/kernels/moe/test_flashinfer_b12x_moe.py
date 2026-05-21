@@ -291,9 +291,10 @@ def test_flashinfer_b12x_moe_relu2(
             num_experts=e,
             experts_per_token=topk,
             hidden_dim=k,
-            intermediate_size=n,
+            intermediate_size_per_partition=n,
             in_dtype=dtype,
             activation=MoEActivation.RELU2_NO_MUL,
+            is_act_and_mul=False,
         )
 
         experts = FlashInferB12xExperts(
