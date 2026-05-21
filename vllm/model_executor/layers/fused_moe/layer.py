@@ -47,6 +47,11 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.trace_utils import (
+    enum_metadata,
+    trace_enabled,
+    trace_event,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -441,6 +446,48 @@ class FusedMoE(PluggableLayer):
             if apply_routed_scale_to_output
             else 1.0,
         )
+
+        if trace_enabled():
+            mp = self.moe_parallel_config
+            trace_event(
+                "vllm.moe.layer_config",
+                {
+                    "layer_name": self.layer_name,
+                    "prefix": prefix,
+                    "moe_backend": self.moe_config.moe_backend,
+                    "quant_method": self.quant_method.__class__.__name__,
+                    "runner_class": self.runner.__class__.__name__,
+                    "router_class": self.router.__class__.__name__,
+                    "num_experts": self.global_num_experts,
+                    "num_logical_experts": self.logical_num_experts,
+                    "num_local_experts": self.local_num_experts,
+                    "top_k": top_k,
+                    "hidden_dim": self.moe_config.hidden_dim,
+                    "hidden_dim_unpadded": self.moe_config.hidden_dim_unpadded,
+                    "intermediate_size_per_partition": (
+                        self.moe_config.intermediate_size_per_partition
+                    ),
+                    "intermediate_size_per_partition_unpadded": (
+                        self.moe_config.intermediate_size_per_partition_unpadded
+                    ),
+                    "routed_scaling_factor": routed_scaling_factor,
+                    "apply_routed_scale_to_output": apply_routed_scale_to_output,
+                    "routing_method_type": enum_metadata(self.routing_method_type),
+                    "activation": enum_metadata(self.activation),
+                    "in_dtype": str(self.moe_config.in_dtype),
+                    "router_logits_dtype": str(self.moe_config.router_logits_dtype),
+                    "max_num_tokens": self.moe_config.max_num_tokens,
+                    "moe_tp_size": mp.tp_size,
+                    "moe_tp_rank": mp.tp_rank,
+                    "moe_ep_size": mp.ep_size,
+                    "moe_ep_rank": mp.ep_rank,
+                    "use_all2all_kernels": mp.use_all2all_kernels,
+                    "enable_eplb": mp.enable_eplb,
+                    "enable_dbo": self.vllm_config.parallel_config.enable_dbo,
+                    "device": str(self.moe_config.device),
+                },
+                dedupe_key={"event": "layer_config", "layer_name": self.layer_name},
+            )
 
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py
     # can safely swap out the quant_method. We should figure out a less
