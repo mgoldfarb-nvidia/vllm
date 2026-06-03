@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -27,6 +27,9 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+if TYPE_CHECKING:
+    from flashinfer.fused_moe import B12xMoEWrapper
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -94,7 +97,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self.source_format = self._detect_source_format()
 
         # Lazily created on first apply() call.
-        self._wrapper: object | None = None
+        self._wrapper: B12xMoEWrapper | None = None
         # Populated in process_weights_after_loading.
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
@@ -218,16 +221,14 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # W4A16 NVFP4 compressed-tensors `nvfp4-pack-quantized`.
         # (askliar #43333: compressed-tensors layout has explicit weight
         # spec but activation_key=None.)
-        if (
+        return (
             weight_key is not None
             and weight_key.dtype == torch.uint8
             and weight_key.scale == kNvfp4StaticGroupScale
             and weight_key.scale2 == kStaticTensorScale
             and weight_key.symmetric
             and activation_key is None
-        ):
-            return True
-        return False
+        )
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -322,10 +323,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         )
 
         self._ensure_wrapper()
-        wrapper = self._wrapper
-        assert wrapper is not None
+        assert self._wrapper is not None
 
-        wrapper_output = wrapper.run(
+        result = self._wrapper.run(
             x=hidden_states,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,
@@ -337,4 +337,4 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             token_selected_experts=topk_ids.to(torch.int32),
             token_final_scales=topk_weights,
         )
-        output.copy_(wrapper_output)
+        output.copy_(result)

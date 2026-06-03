@@ -52,7 +52,6 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,

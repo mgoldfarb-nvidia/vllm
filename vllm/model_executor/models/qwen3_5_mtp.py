@@ -113,9 +113,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             for idx in range(self.num_mtp_layers):
                 for eid in range(num_experts):
                     for proj in ("gate_proj", "up_proj", "down_proj"):
-                        extra.append(
-                            f"{prefix}.layers.{idx}.mlp.experts.{eid}.{proj}"
-                        )
+                        extra.append(f"{prefix}.layers.{idx}.mlp.experts.{eid}.{proj}")
             new_entries = [n for n in extra if n not in quant_config.ignore]
             quant_config.ignore.extend(new_entries)
             if new_entries:

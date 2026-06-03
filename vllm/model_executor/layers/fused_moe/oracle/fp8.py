@@ -270,8 +270,9 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
     }
     if backend := mapping.get(effective):
         return backend
-    src = ("VLLM_FP8_MOE_BACKEND env var"
-           if envs.VLLM_FP8_MOE_BACKEND else "--moe-backend")
+    src = (
+        "VLLM_FP8_MOE_BACKEND env var" if envs.VLLM_FP8_MOE_BACKEND else "--moe-backend"
+    )
     raise ValueError(
         f"FP8 MoE backend='{effective}' (from {src}) is not supported. "
         f"Expected one of {list(mapping.keys())}."

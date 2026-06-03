@@ -1649,8 +1649,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FP8_MOE_BACKEND": env_with_choices(
         "VLLM_FP8_MOE_BACKEND",
         None,
-        ["triton", "deep_gemm", "cutlass", "flashinfer_trtllm",
-         "flashinfer_cutlass", "marlin", "aiter"],
+        [
+            "triton",
+            "deep_gemm",
+            "cutlass",
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "marlin",
+            "aiter",
+        ],
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
