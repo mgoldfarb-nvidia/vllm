@@ -114,7 +114,7 @@ install(CODE "
     # though SM 10.3 is in the supported family per the assert message.
     # Replace the broken numeric-range check with a name-prefix check that
     # is stable across cutlass-dsl versions.
-    string(REPLACE \"self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f\" \"self.arch.name.startswith(('sm_100', 'sm_101', 'sm_103', 'sm_110'))\" FILE_CONTENTS \"\${FILE_CONTENTS}\")
+    string(REPLACE \"self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f\" \"self.arch.name.startswith(('sm_100', 'sm_101', 'sm_103', 'sm_107', 'sm_110'))\" FILE_CONTENTS \"\${FILE_CONTENTS}\")
     file(WRITE \${DST_FILE} \"\${FILE_CONTENTS}\")
   endforeach()
 " COMPONENT _vllm_fa4_cutedsl_C)
