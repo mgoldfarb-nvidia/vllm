@@ -59,7 +59,11 @@ class TranscriptionRequest(OpenAIBaseModel):
     file: UploadFile
     """
     The audio file object (not file name) to transcribe, in one of these
-    formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.
+    formats: flac, ogg, wav (reliably supported), or mp3/mpeg/mpga (only
+    when the deployed libsndfile build includes MP3 — soundfile >= 0.13
+    / libsndfile >= 1.1.0). AAC/MP4/M4A and WebM/Opus are not supported
+    following the royalty-bearing codec removal; re-encode to FLAC, OGG,
+    or WAV before submitting.
     """
 
     model: str | None = None

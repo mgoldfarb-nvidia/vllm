@@ -15,7 +15,6 @@ from vllm.multimodal.audio import (
     AudioSpec,
     ChannelReduction,
     normalize_audio,
-    resample_audio_pyav,
     resample_audio_scipy,
     split_audio,
 )
@@ -24,16 +23,6 @@ from vllm.multimodal.audio import (
 @pytest.fixture
 def dummy_audio():
     return np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=float)
-
-
-def test_resample_audio_pyav(dummy_audio):
-    out_down = resample_audio_pyav(dummy_audio, orig_sr=4, target_sr=2)
-    out_up = resample_audio_pyav(dummy_audio, orig_sr=2, target_sr=4)
-    out_same = resample_audio_pyav(dummy_audio, orig_sr=4, target_sr=4)
-
-    assert len(out_down) == 3
-    assert len(out_up) == 10
-    assert np.all(out_same == dummy_audio)
 
 
 def test_resample_audio_scipy(dummy_audio):
@@ -76,17 +65,6 @@ def test_resample_audio_scipy_resamples_last_axis_for_multichannel():
     assert np.isfinite(out).all()
 
 
-def test_audio_resampler_pyav_calls_resample(dummy_audio):
-    resampler = AudioResampler(target_sr=22050, method="pyav")
-    with patch("vllm.multimodal.audio.resample_audio_pyav") as mock_resample:
-        mock_resample.return_value = dummy_audio
-        out = resampler.resample(dummy_audio, orig_sr=44100)
-        mock_resample.assert_called_once_with(
-            dummy_audio, orig_sr=44100, target_sr=22050
-        )
-        assert np.all(out == dummy_audio)
-
-
 def test_audio_resampler_scipy_calls_resample(dummy_audio):
     resampler = AudioResampler(target_sr=22050, method="scipy")
     with patch("vllm.multimodal.audio.resample_audio_scipy") as mock_resample:
@@ -96,12 +74,6 @@ def test_audio_resampler_scipy_calls_resample(dummy_audio):
             dummy_audio, orig_sr=44100, target_sr=22050
         )
         assert np.all(out == dummy_audio)
-
-
-def test_audio_resampler_invalid_method(dummy_audio):
-    resampler = AudioResampler(target_sr=22050, method="invalid")
-    with pytest.raises(ValueError):
-        resampler.resample(dummy_audio, orig_sr=44100)
 
 
 def test_audio_resampler_no_target_sr(dummy_audio):
@@ -443,13 +415,13 @@ class TestAudioPipelineE2E:
         # Verify channel averaging: mean of [0.5, -0.5] = 0.0
         np.testing.assert_array_almost_equal(audio_output, np.zeros(16000), decimal=5)
 
-    def test_pyav_mono_passthrough_e2e(self):
-        """Full pipeline: pyav mono format → preserved as mono."""
+    def test_mono_1d_passthrough_e2e(self):
+        """Full pipeline: 1-D mono audio array → preserved as mono."""
         from vllm.multimodal.parse import MultiModalDataParser
 
-        # Simulate pyav output: already mono (time,) format
-        mono_pyav = np.random.randn(16000).astype(np.float32)
-        assert mono_pyav.shape == (16000,)
+        # Simulate decoder output that is already mono in (time,) shape.
+        mono_audio = np.random.randn(16000).astype(np.float32)
+        assert mono_audio.shape == (16000,)
 
         # Create parser with mono normalization
         parser = MultiModalDataParser(
@@ -458,7 +430,7 @@ class TestAudioPipelineE2E:
         )
 
         # Process audio through the parser
-        result = parser._parse_audio_data((mono_pyav, 16000))
+        result = parser._parse_audio_data((mono_audio, 16000))
         audio_output = result.get(0)
 
         # Verify output is still mono 1D
@@ -466,7 +438,7 @@ class TestAudioPipelineE2E:
         assert audio_output.shape == (16000,)
 
         # Verify audio content is preserved
-        np.testing.assert_array_almost_equal(audio_output, mono_pyav)
+        np.testing.assert_array_almost_equal(audio_output, mono_audio)
 
     def test_multichannel_5_1_surround_to_mono_e2e(self):
         """Full pipeline: 5.1 surround (6 channels) → mono output."""
@@ -743,6 +715,29 @@ class TestAudioChunking:
         # Current implementation evaluates non-overlapping 1600-sample windows
         # from start_idx, so the quietest scanned window starts at 19200.
         assert split_idx == 19200
+
+    def test_find_split_point_short_search_region_returns_start_idx(self):
+        """When the search region is shorter than `min_energy_window`, the
+        loop body never executes; the function must return `start_idx`
+        rather than `0`, otherwise `split_audio` produces a zero-length
+        leading chunk. Regression test for the fix where `quietest_idx`
+        was previously initialised to 0.
+        """
+        from vllm.multimodal.audio import find_split_point
+
+        segment = np.ones(32000, dtype=np.float32)
+        # Search region length (100) is much smaller than the energy window
+        # (1600), so no window fits and the loop never iterates.
+        split_idx = find_split_point(
+            wav=segment,
+            start_idx=20000,
+            end_idx=20100,
+            min_energy_window=1600,
+        )
+
+        assert split_idx == 20000, (
+            f"Expected start_idx (20000) when no window fits; got {split_idx}"
+        )
 
     def test_split_audio_preserves_boundaries(self):
         """Verify first and last samples are preserved when chunking."""

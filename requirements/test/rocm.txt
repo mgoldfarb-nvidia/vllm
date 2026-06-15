@@ -60,8 +60,6 @@ attrs==26.1.0
     #   referencing
 audioread==3.0.1
     # via librosa
-av==16.1.0
-    # via -r requirements/test/rocm.in
 azure-core==1.39.0
     # via
     #   azure-identity
@@ -1054,6 +1052,8 @@ scikit-learn==1.8.0
     #   sentence-transformers
 scipy==1.17.1
     # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
     #   albumentations
     #   bm25s
     #   imagehash
@@ -1110,6 +1110,8 @@ sortedcontainers==2.4.0
     # via hypothesis
 soundfile==0.13.1
     # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
     #   -r requirements/test/rocm.in
     #   genai-perf
     #   librosa
@@ -1214,7 +1216,7 @@ tqdm==4.67.3
     #   sentence-transformers
     #   tilelang
     #   transformers
-transformers==5.6.0
+transformers==5.6.1
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
@@ -1331,7 +1333,7 @@ word2number==1.1
     # via lm-eval
 wrapt==2.1.2
     # via smart-open
-xgrammar==0.2.1
+xgrammar==0.2.0
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt

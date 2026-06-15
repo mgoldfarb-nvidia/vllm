@@ -662,7 +662,6 @@ RUN apt-get update -y \
         software-properties-common \
         curl \
         sudo \
-        ffmpeg \
         libsm6 \
         libxext6 \
         libgl1 \
@@ -716,6 +715,26 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}') && \
     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
+
+# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
+# See tools/build-ffmpeg-safe.sh for the exact configure flags.
+# strip-opencv-bundled-codecs.sh and verify-ffmpeg-safe.sh are also copied
+# here but kept until after the vLLM install so they can be re-invoked to
+# strip the FFmpeg libs that opencv-python-headless wheels bundle.
+COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
+COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+RUN bash /tmp/build-ffmpeg-safe.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && rm /tmp/build-ffmpeg-safe.sh \
+    && rm -rf /var/lib/apt/lists/*
+ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
@@ -873,6 +892,13 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
 uv pip list
+
+# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
+# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
+# codec-safe end-to-end. Must run after the vLLM pip install above.
+RUN bash /tmp/strip-opencv-bundled-codecs.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
 
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH

@@ -82,8 +82,14 @@ First, install the recommended compiler. We recommend using `gcc/g++ >= 12.3.0` 
 
 ```bash
 sudo apt-get update  -y
-sudo apt-get install -y --no-install-recommends ccache git curl wget ca-certificates gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev ffmpeg libsm6 libxext6 libgl1 jq lsof
+sudo apt-get install -y --no-install-recommends ccache git curl wget ca-certificates gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev libsm6 libxext6 libgl1 jq lsof
 sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+# Build codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC) — see tools/build-ffmpeg-safe.sh
+sudo bash tools/build-ffmpeg-safe.sh
+sudo bash tools/verify-ffmpeg-safe.sh
+export PATH=/opt/ffmpeg-safe/bin:$PATH
+export LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
 ```
 
 Second, clone the vLLM project:

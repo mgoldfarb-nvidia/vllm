@@ -61,8 +61,6 @@ attrs==24.2.0
     #   referencing
 audioread==3.0.1
     # via librosa
-av==16.1.0
-    # via -r requirements/test/cuda.in
 azure-core==1.38.2
     # via
     #   azure-identity
@@ -833,7 +831,7 @@ pyarrow==23.0.0
     # via
     #   datasets
     #   genai-perf
-pyasn1==0.6.3  # CVE-2026-30922
+pyasn1==0.6.3
     # via
     #   pyasn1-modules
     #   rsa
@@ -1071,6 +1069,7 @@ scikit-learn==1.5.2
     #   sentence-transformers
 scipy==1.13.1
     # via
+    #   -c requirements/common.txt
     #   albumentations
     #   bm25s
     #   imagehash
@@ -1123,6 +1122,7 @@ sortedcontainers==2.4.0
     # via hypothesis
 soundfile==0.12.1
     # via
+    #   -c requirements/common.txt
     #   -r requirements/test/cuda.in
     #   genai-perf
     #   librosa
@@ -1253,7 +1253,7 @@ tqdm==4.67.3
     #   segmentation-models-pytorch
     #   sentence-transformers
     #   transformers
-transformers==5.6.0
+transformers==5.6.1
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt

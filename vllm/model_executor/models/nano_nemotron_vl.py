@@ -53,7 +53,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     VideoItem,
 )
-from vllm.multimodal.media.audio import load_audio_pyav
+from vllm.multimodal.media.audio import load_audio
 from vllm.multimodal.parse import (
     AudioProcessorItems,
     ImageEmbeddingItems,
@@ -627,7 +627,7 @@ class NanoNemotronVLMultiModalProcessor(
                     "the chat API with a model that sets use_audio_in_video)."
                 )
             try:
-                audio_items.append(load_audio_pyav(BytesIO(video_bytes)))
+                audio_items.append(load_audio(BytesIO(video_bytes)))
                 has_audio.append(True)
             except Exception:
                 logger.debug(

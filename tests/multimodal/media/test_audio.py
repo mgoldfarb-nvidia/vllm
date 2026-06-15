@@ -86,10 +86,11 @@ def test_load_audio_max_duration_rejected(dummy_audio_bytes):
 
 
 def test_audio_media_io_from_video(video_assets):
+    """MP4/AAC container audio is intentionally not supported after codec removal."""
     audio_io = AudioMediaIO()
     video_path = video_assets[0].video_path
-    with open(video_path, "rb") as f:
-        audio, sr = audio_io.load_bytes(f.read())
-    audio_ref, sr_ref = load_audio(video_path, sr=None)
-    assert sr == sr_ref
-    np.testing.assert_allclose(audio_ref, audio, atol=1e-4)
+    with (
+        open(video_path, "rb") as f,
+        pytest.raises(ValueError, match="AAC/MP4/M4A"),
+    ):
+        audio_io.load_bytes(f.read())

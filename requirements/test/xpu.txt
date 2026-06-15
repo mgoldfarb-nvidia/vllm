@@ -795,6 +795,7 @@ scikit-learn==1.8.0
     #   sentence-transformers
 scipy==1.17.1
     # via
+    #   -c requirements/common.txt
     #   albumentations
     #   bm25s
     #   librosa
@@ -837,6 +838,7 @@ sortedcontainers==2.4.0
     # via hypothesis
 soundfile==0.13.1
     # via
+    #   -c requirements/common.txt
     #   -r requirements/test/xpu.in
     #   librosa
     #   mistral-common
@@ -936,7 +938,7 @@ tqdm==4.67.3
     #   pqdm
     #   sentence-transformers
     #   transformers
-transformers==5.6.0
+transformers==5.6.1
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt

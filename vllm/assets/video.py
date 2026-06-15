@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 from PIL import Image
 
-from vllm.multimodal.media.audio import load_audio_pyav
+from vllm.multimodal.media.audio import load_audio
 from vllm.transformers_utils.repo_utils import hf_api
 
 from .base import get_cache_dir
@@ -146,4 +146,4 @@ class VideoAsset:
 
         See also: examples/generate/multimodal/qwen2_5_omni/only_thinker.py
         """
-        return load_audio_pyav(self.video_path, sr=sampling_rate)[0]
+        return load_audio(self.video_path, sr=sampling_rate)[0]

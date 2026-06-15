@@ -3,6 +3,8 @@ cachetools
 psutil
 sentencepiece  # Required for LLaMA tokenizer.
 numpy
+scipy >= 1.10  # required for audio resampling (resample_audio_scipy)
+soundfile >= 0.12.0  # required for royalty-free audio decode (WAV/FLAC/OGG)
 requests >= 2.26.0
 tqdm
 blake3
@@ -34,6 +36,12 @@ jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
 pyzmq >= 25.0.0
 msgspec
 mistral_common[image] >= 1.11.5
+# TODO: opencv-python-headless wheels bundle their own FFmpeg under
+# site-packages/opencv_python_headless.libs/, which includes native H.264,
+# H.265/HEVC, and AAC decoders. /opt/ffmpeg-safe (MR !481/!482) does not
+# close this path because cv2 is RPATH-linked to its bundled libs. See
+# docs/royalty_codec_audit_report.md "Known gap" section for mitigation
+# options. Track replacement work in a follow-up issue before merging.
 opencv-python-headless >= 4.13.0    # required for video IO
 pyyaml
 six>=1.16.0; python_version > '3.11' # transitive dependency of pandas that needs to be the latest version for python 3.12

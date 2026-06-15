@@ -45,7 +45,6 @@ RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
     build-essential \
     curl \
-    ffmpeg \
     git \
     gpg \
     libsndfile1 \
@@ -62,6 +61,24 @@ RUN apt-get update -y && \
     python3.12-dev \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
+
+# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
+# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
+# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+# libs that opencv-python-headless wheels bundle).
+COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
+COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+RUN bash /tmp/build-ffmpeg-safe.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && rm /tmp/build-ffmpeg-safe.sh
+ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
 
 # Add oneAPI repo, pin oneAPI to 2025.3, then install pinned packages in one layer.
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
@@ -241,5 +258,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -e tests/vllm_test_utils
+
+# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
+# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
+# codec-safe end-to-end. Must run after all vLLM pip installs above.
+RUN bash /tmp/strip-opencv-bundled-codecs.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
 
 ENTRYPOINT ["vllm", "serve"]

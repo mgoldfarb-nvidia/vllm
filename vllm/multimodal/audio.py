@@ -12,11 +12,6 @@ import torch
 from vllm.utils.import_utils import PlaceholderModule
 
 try:
-    import av as av
-except ImportError:
-    av = PlaceholderModule("av")  # type: ignore[assignment]
-
-try:
     import scipy.signal as scipy_signal
 except ImportError:
     scipy_signal = PlaceholderModule("scipy").placeholder_attr("signal")  # type: ignore[assignment]
@@ -127,7 +122,17 @@ def normalize_audio(
         raise ValueError(f"Unsupported audio shape: {audio.shape}. Expected 1D or 2D.")
 
     # Auto-detect format: if shape[0] > shape[1], assume (time, channels)
-    # This handles soundfile format where time dimension is typically much larger
+    # and transpose to (channels, time). This handles the soundfile layout
+    # where the time dimension is typically much larger than channels.
+    #
+    # KNOWN LIMITATION: this heuristic relies on `time >> channels`, which
+    # holds for any realistic audio (1-second mono at 16 kHz already has
+    # 16000 samples). It misfires only for pathological inputs where
+    # channels >= time samples — e.g. an 8-channel clip with <8 samples,
+    # or a perfectly square array. Such inputs are unreachable from the
+    # public audio decode paths but can occur in unit tests that synthesise
+    # tiny arrays — the square-array ambiguity is documented in the
+    # corresponding unit test suite for this module.
     if audio.shape[0] > audio.shape[1]:
         # Transpose from (time, channels) to (channels, time)
         audio = audio.T if isinstance(audio, np.ndarray) else audio.T
@@ -169,64 +174,6 @@ def normalize_audio(
 # ============================================================
 # Audio Resampling
 # ============================================================
-
-
-def resample_audio_pyav(
-    audio: npt.NDArray[np.floating],
-    *,
-    orig_sr: float,
-    target_sr: float,
-) -> npt.NDArray[np.floating]:
-    """Resample audio using PyAV (libswresample via FFmpeg).
-
-    Args:
-        audio: Input audio. Can be:
-            - 1D array ``(samples,)``: mono audio
-            - 2D array ``(channels, samples)``: stereo audio
-        orig_sr: Original sample rate in Hz.
-        target_sr: Target sample rate in Hz.
-
-    Returns:
-        Resampled audio with the same shape as the input (1D → 1D, 2D → 2D).
-    """
-    orig_sr_int = int(round(orig_sr))
-    target_sr_int = int(round(target_sr))
-
-    if orig_sr_int == target_sr_int:
-        return audio
-
-    if audio.ndim == 2:
-        # Resample each channel independently and re-stack.
-        return np.stack(
-            [
-                resample_audio_pyav(ch, orig_sr=orig_sr, target_sr=target_sr)
-                for ch in audio
-            ],
-            axis=0,
-        )
-
-    expected_len = int(math.ceil(audio.shape[-1] * target_sr_int / orig_sr_int))
-
-    # from_ndarray expects shape (channels, samples) for planar formats.
-    # libswresample requires a minimum number of input samples to produce
-    # output frames; pad short inputs with zeros so we always get output,
-    # then trim to the expected output length.
-    _MIN_SAMPLES = 1024
-    audio_f32 = np.asarray(audio, dtype=np.float32)
-    if len(audio_f32) < _MIN_SAMPLES:
-        audio_f32 = np.pad(audio_f32, (0, _MIN_SAMPLES - len(audio_f32)))
-    audio_f32 = audio_f32.reshape(1, -1)
-
-    resampler = av.AudioResampler(format="fltp", layout="mono", rate=target_sr_int)
-
-    frame = av.AudioFrame.from_ndarray(audio_f32, format="fltp", layout="mono")
-    frame.sample_rate = orig_sr_int
-
-    out_frames = resampler.resample(frame)
-    out_frames.extend(resampler.resample(None))  # flush buffered samples
-
-    result = np.concatenate([f.to_ndarray() for f in out_frames], axis=1).squeeze(0)
-    return result[:expected_len]
 
 
 def resample_audio_scipy(
@@ -275,13 +222,24 @@ def resample_audio_soxr(
 
 
 class AudioResampler:
-    """Resample audio data to a target sample rate."""
+    """Resample audio data to a target sample rate.
+
+    Only the FFmpeg-free backends ``"scipy"`` and ``"soxr"`` are accepted
+    following the royalty-bearing codec removal (the former ``"pyav"``
+    backend required FFmpeg's libswresample). Validation happens at
+    construction time so an unsupported method is not silently ignored.
+    """
 
     def __init__(
         self,
         target_sr: float | None = None,
-        method: Literal["pyav", "scipy", "soxr"] = "pyav",
+        method: Literal["scipy", "soxr"] = "scipy",
     ):
+        if method not in ("scipy", "soxr"):
+            raise ValueError(
+                f"Unsupported audio resample method {method!r}; "
+                "only 'scipy' and 'soxr' are supported."
+            )
         self.target_sr = target_sr
         self.method = method
 
@@ -302,9 +260,7 @@ class AudioResampler:
             abs_tol=1e-6,
         ):
             return audio
-        if self.method == "pyav":
-            return resample_audio_pyav(audio, orig_sr=orig_sr, target_sr=self.target_sr)
-        elif self.method == "scipy":
+        if self.method == "scipy":
             return resample_audio_scipy(
                 audio, orig_sr=orig_sr, target_sr=self.target_sr
             )
@@ -313,7 +269,7 @@ class AudioResampler:
         else:
             raise ValueError(
                 f"Invalid resampling method: {self.method}. "
-                "Supported methods are 'pyav', 'scipy', and 'soxr'."
+                "Supported methods are 'scipy' and 'soxr'."
             )
 
 
@@ -426,7 +382,9 @@ def find_split_point(
     """
     segment = wav[start_idx:end_idx]
 
-    # Calculate RMS energy in small windows
+    # Calculate RMS energy in small windows. If the search segment is
+    # shorter than `min_energy_window` the loop never executes — fall back
+    # to `start_idx` so the returned index stays inside the search range.
     min_energy = math.inf
     quietest_idx = start_idx
 

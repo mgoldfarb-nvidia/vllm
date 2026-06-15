@@ -7,8 +7,26 @@ WORKDIR /workspace/vllm
 # Install some basic utilities
 RUN apt-get update && apt-get install -y \
     git \
-    ffmpeg libsm6 libxext6 libgl1 && \
+    libsm6 libxext6 libgl1 && \
     rm -rf /var/lib/apt/lists/*
+
+# Build and install codec-safe FFmpeg (no H.264, H.265/HEVC, or AAC).
+# verify-ffmpeg-safe.sh and strip-opencv-bundled-codecs.sh are retained at
+# /tmp so they can be re-invoked after pip installs (to strip the FFmpeg
+# libs that opencv-python-headless wheels bundle).
+COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
+COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
+COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
+RUN bash /tmp/build-ffmpeg-safe.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+        bash /tmp/build-ffmpeg-safe.sh \
+    && rm /tmp/build-ffmpeg-safe.sh
+ENV PATH=/opt/ffmpeg-safe/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ENV PKG_CONFIG_PATH=/opt/ffmpeg-safe/lib/pkgconfig:$PKG_CONFIG_PATH
 
 # Build vLLM.
 COPY . .
@@ -32,5 +50,12 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e .
 
 # install development dependencies (for testing)
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e tests/vllm_test_utils
+
+# Strip the FFmpeg shared libraries that opencv-python-headless wheels bundle
+# (private libavcodec containing H.264/HEVC/AAC) and re-verify the image is
+# codec-safe end-to-end. Must run after the vLLM pip install above.
+RUN bash /tmp/strip-opencv-bundled-codecs.sh \
+    && bash /tmp/verify-ffmpeg-safe.sh \
+    && rm /tmp/strip-opencv-bundled-codecs.sh /tmp/verify-ffmpeg-safe.sh
 
 CMD ["/bin/bash"]
