@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Verify that the installed FFmpeg does NOT support the royalty-bearing
 # codecs (H.264, H.265/HEVC, AAC).
 #

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Replace the bundled FFmpeg shared libraries that opencv-python-headless
 # wheels ship under site-packages/opencv_python_headless.libs/ with symlinks
 # to a codec-safe FFmpeg shim of matching SONAME major version.
@@ -52,7 +55,7 @@ if [[ ${#shim_for_soname[@]} -eq 0 ]]; then
     echo "[strip-opencv-bundled-codecs] ERROR: no codec-safe shim found under ${FFMPEG_CV2_SHIM_GLOB}" >&2
     echo "  Build at least one cv2 shim before running this script, e.g.:" >&2
     echo "    FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 bash build-ffmpeg-safe.sh" >&2
-    echo "    FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 bash build-ffmpeg-safe.sh" >&2
+    echo "    FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 bash build-ffmpeg-safe.sh" >&2
     exit 1
 fi
 

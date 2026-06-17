@@ -36,12 +36,15 @@ jsonschema >= 4.23.0 # required for MiniMax M3 tool schema validation
 pyzmq >= 25.0.0
 msgspec
 mistral_common[image] >= 1.11.5
-# TODO: opencv-python-headless wheels bundle their own FFmpeg under
-# site-packages/opencv_python_headless.libs/, which includes native H.264,
-# H.265/HEVC, and AAC decoders. /opt/ffmpeg-safe (MR !481/!482) does not
-# close this path because cv2 is RPATH-linked to its bundled libs. See
-# docs/royalty_codec_audit_report.md "Known gap" section for mitigation
-# options. Track replacement work in a follow-up issue before merging.
+# opencv-python-headless wheels bundle their own FFmpeg under
+# site-packages/opencv_python_headless.libs/, which historically included
+# native H.264, H.265/HEVC, and AAC decoders. For Docker-based installs
+# this gap is now closed by tools/strip-opencv-bundled-codecs.sh, which
+# replaces the bundled libav* with symlinks to the codec-safe shim builds
+# at /opt/ffmpeg-safe-cv2-shim-v{5,8} (built via tools/build-ffmpeg-safe.sh).
+# TODO: bare `pip install vllm` outside Docker does not benefit from the
+# strip step. Track replacement work for pip-only installs in a follow-up
+# issue.
 opencv-python-headless >= 4.13.0    # required for video IO
 pyyaml
 six>=1.16.0; python_version > '3.11' # transitive dependency of pandas that needs to be the latest version for python 3.12

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Build a codec-safe FFmpeg from source.
 #
 # LOOSE variant: disables the H.264, H.265/HEVC, and AAC codec
@@ -14,25 +17,32 @@
 
 set -euo pipefail
 
-FFMPEG_VERSION="${FFMPEG_VERSION:-7.1}"
+FFMPEG_VERSION="${FFMPEG_VERSION:-8.1.1}"
 FFMPEG_PREFIX="${FFMPEG_PREFIX:-/opt/ffmpeg-safe}"
 FFMPEG_TARBALL_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
 # Tarball hash pinned in-script for tamper-evident builds. Update when
 # bumping FFMPEG_VERSION. The upstream .sha256sum URL is not reliably
 # served (404 on some releases), so we inline the canonical hash here
 # instead of fetching it from the same host as the tarball.
-FFMPEG_SHA256_7_1="40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
+#
+# Default 8.1.1 pin is shared with the amd64 cv2 shim. See the
+# FFMPEG_SHA256_8_1_1 declaration below.
 # FFmpeg 5.1 LTS pin — used by the cv2-shim variant whose SONAME majors
 # (libavcodec.so.59, libavformat.so.59, libavutil.so.57, libswscale.so.6,
 # libswresample.so.4) match opencv-python-headless 4.13's bundled FFmpeg
 # on arm64 / aarch64.
 FFMPEG_SHA256_5_1_6="f4fa066278f7a47feab316fef905f4db0d5e9b589451949740f83972b30901bd"
-# FFmpeg 8.0 LTS pin — used by the cv2-shim variant whose SONAME majors
+# FFmpeg 8.1.1 pin — used by the cv2-shim variant whose SONAME majors
 # (libavcodec.so.62, libavformat.so.62, libavutil.so.60, libswscale.so.9,
 # libswresample.so.6) match opencv-python-headless 4.13's bundled FFmpeg
 # on amd64 / x86_64. The wheel builders apparently bundle different
 # FFmpeg majors per platform, so both shims are required.
-FFMPEG_SHA256_8_0_2="5d16962332603c427b3d0887fc12b9166d6ee2cb1108b1865dd2d5eb06a09505"
+#
+# 8.1.x is the first release line that contains the CENC-subsample
+# integer-overflow fix (CVE-2026-40962) in libavformat/mov.c. SONAME
+# stays at 62 across 8.x, so this is ABI-compatible with the opencv
+# amd64 wheel's bundled libavcodec.so.62.
+FFMPEG_SHA256_8_1_1="b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3"
 BUILD_DIR="$(mktemp -d)"
 
 echo "[build-ffmpeg-safe] Installing build dependencies..."
@@ -42,6 +52,7 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
     xz-utils \
+    patch \
     pkg-config \
     build-essential \
     nasm \
@@ -68,6 +79,30 @@ fi
 echo "${expected_sha256}  ${tarball}" | sha256sum -c -
 tar -xf "${tarball}"
 cd "ffmpeg-${FFMPEG_VERSION}"
+
+# Apply any version-specific backport patches. Patches live next to this
+# script under ffmpeg-patches/ and are named "${FFMPEG_VERSION}-<slug>.patch"
+# so the script can pick the right set for whichever version is being built.
+# This is how downstream CVE backports land on FFmpeg versions whose SONAME
+# is pinned by ABI compatibility constraints (e.g. the 5.1.6 shim that has
+# to match opencv-python-headless's bundled libavcodec.so.59 on arm64).
+FFMPEG_PATCHES_DIR="${FFMPEG_PATCHES_DIR:-/tmp/ffmpeg-patches}"
+if [[ -d "${FFMPEG_PATCHES_DIR}" ]]; then
+    shopt -s nullglob
+    patches=("${FFMPEG_PATCHES_DIR}"/"${FFMPEG_VERSION}"-*.patch)
+    shopt -u nullglob
+    if (( ${#patches[@]} > 0 )); then
+        echo "[build-ffmpeg-safe] Applying ${#patches[@]} backport patch(es) for FFmpeg ${FFMPEG_VERSION}:"
+        for p in "${patches[@]}"; do
+            echo "  - $(basename "${p}")"
+            patch -p1 < "${p}"
+        done
+    else
+        echo "[build-ffmpeg-safe] No backport patches found for FFmpeg ${FFMPEG_VERSION} under ${FFMPEG_PATCHES_DIR}"
+    fi
+else
+    echo "[build-ffmpeg-safe] Patches dir ${FFMPEG_PATCHES_DIR} not present; skipping patch application."
+fi
 
 echo "[build-ffmpeg-safe] Configuring (LOOSE: codecs disabled, MP4/MOV demuxers preserved)..."
 ./configure \

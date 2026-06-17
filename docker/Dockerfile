@@ -722,15 +722,21 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
 # here but kept until after the vLLM install so they can be re-invoked to
 # strip the FFmpeg libs that opencv-python-headless wheels bundle.
 COPY tools/build-ffmpeg-safe.sh /tmp/build-ffmpeg-safe.sh
+COPY tools/ffmpeg-patches /tmp/ffmpeg-patches
 COPY tools/verify-ffmpeg-safe.sh /tmp/verify-ffmpeg-safe.sh
 COPY tools/strip-opencv-bundled-codecs.sh /tmp/strip-opencv-bundled-codecs.sh
 RUN bash /tmp/build-ffmpeg-safe.sh \
     && bash /tmp/verify-ffmpeg-safe.sh \
     && FFMPEG_VERSION=5.1.6 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
         bash /tmp/build-ffmpeg-safe.sh \
-    && FFMPEG_VERSION=8.0.2 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v5 \
+        bash /tmp/verify-ffmpeg-safe.sh \
+    && FFMPEG_VERSION=8.1.1 FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
         bash /tmp/build-ffmpeg-safe.sh \
+    && FFMPEG_PREFIX=/opt/ffmpeg-safe-cv2-shim-v8 \
+        bash /tmp/verify-ffmpeg-safe.sh \
     && rm /tmp/build-ffmpeg-safe.sh \
+    && rm -rf /tmp/ffmpeg-patches \
     && rm -rf /var/lib/apt/lists/*
 ENV PATH=/opt/ffmpeg-safe/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/ffmpeg-safe/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
