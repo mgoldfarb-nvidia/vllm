@@ -20,12 +20,20 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_STANDARD_REQUIRED ON)
 
-# PyTorch headers require C++20; GCC < 11.3 has incomplete C++20 support.
+# NVIDIA-internal container build: soften upstream GCC >= 11.3 gate to a warning
+# for the duration of the 26.06 monthly release. Rationale: dgx/pytorch main-line
+# wheel images still ship GCC 11.2.1 while the GCC 13 (manylinux_2_34) rebuild is
+# blocked on BOLT profile recompile (see dgx/pytorch !2014 / !1955). Upstream added
+# this gate in vllm-project/vllm to guard PyTorch's C++20 header requirements
+# (vllm-project/pytorch#167929). Track option-1 (base image bump) as the canonical
+# path; this branch exists to A/B whether the older toolchain actually miscompiles
+# _C_stable_libtorch, so we know the cost of holding back on the base image.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "11.3")
-  message(FATAL_ERROR
-    "GCC >= 11.3 is required to build vLLM (found ${CMAKE_CXX_COMPILER_VERSION}). "
-    "PyTorch's C++20 headers require a compiler with full C++20 support. "
-    "See: https://github.com/pytorch/pytorch/pull/167929")
+  message(WARNING
+    "GCC ${CMAKE_CXX_COMPILER_VERSION} < 11.3: PyTorch's C++20 headers may not "
+    "compile cleanly (see https://github.com/pytorch/pytorch/pull/167929). "
+    "Continuing under the internal-container manylinux_2_28 toolchain until "
+    "the manylinux_2_34 base is available.")
 endif()
 
 
