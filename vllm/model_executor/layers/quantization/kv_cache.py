@@ -30,7 +30,15 @@ class KVCacheScaleParameter(torch.nn.Parameter):
         return super().__new__(cls, torch.tensor(-1.0), requires_grad=False)
 
     @staticmethod
-    def weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    def weight_loader(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str | int | None = None,
+    ) -> None:
+        # `shard_id` is accepted for compatibility with the stacked/fused
+        # weight-loading path (e.g. qwen2.py), which passes it to every
+        # non-default loader. KV-cache scales are shared per-layer scalars,
+        # so the shard is irrelevant here; per-head scales use a separate path.
         if loaded_weight.numel() != 1:
             raise ValueError(
                 f"KV-cache scale expects a scalar weight, got shape "
