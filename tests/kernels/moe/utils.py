@@ -76,7 +76,9 @@ def make_dummy_moe_config(
         num_logical_experts=num_experts,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         activation=activation,
-        is_act_and_mul=is_act_and_mul,
+        # `is_act_and_mul` is a derived property of FusedMoEConfig
+        # (== activation.is_gated), not a constructor arg. It is determined
+        # by `activation`; the kwarg above is retained for call-site compat.
         in_dtype=in_dtype,
         device="cuda",
         routing_method=RoutingMethodType.TopK,
