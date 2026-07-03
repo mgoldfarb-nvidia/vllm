@@ -388,6 +388,16 @@ def flash_attn_varlen_func(
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
+        # `dynamic_causal` and `output_scale` are newer FA4 cute kwargs that
+        # older pinned flash-attn builds don't accept. Only forward them when
+        # set so we stay compatible with those builds (both are None on the
+        # MLA-prefill / ViT paths used here).
+        fa4_extra = {}
+        if dynamic_causal is not None:
+            fa4_extra["dynamic_causal"] = dynamic_causal
+        if output_scale is not None:
+            fa4_extra["output_scale"] = output_scale
+
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -400,7 +410,6 @@ def flash_attn_varlen_func(
             page_table=block_table,
             softmax_scale=softmax_scale,
             causal=causal,
-            dynamic_causal=dynamic_causal,
             softcap=softcap,
             window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
@@ -410,7 +419,7 @@ def flash_attn_varlen_func(
             learnable_sink=s_aux,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
-            output_scale=output_scale,
+            **fa4_extra,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

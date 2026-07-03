@@ -40,6 +40,24 @@ else:
     flash_attn_varlen_func = None  # type: ignore[assignment]
 
 
+@functools.cache
+def _fa4_cute_supports_output_scale() -> bool:
+    """Whether the installed FA4 cute kernel accepts fused-FP8-output.
+
+    Older pinned flash-attn builds have no `output_scale` parameter, so the
+    fused-quantized-output optimization must be disabled for them (the model
+    falls back to computing bf16 attention and quantizing separately).
+    """
+    try:
+        import inspect
+
+        from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+        return "output_scale" in inspect.signature(_flash_attn_fwd).parameters
+    except Exception:
+        return False
+
+
 class FlashAttnPrefillBackend(MLAPrefillBackend):
     """FlashAttention backend for MLA prefill."""
 
@@ -176,6 +194,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             and device_capability is not None
             and device_capability[0] in (10, 11)
             and quant_key == kFp8StaticTensorSym
+            and _fa4_cute_supports_output_scale()
         )
 
     def _flash_attn_varlen_diff_headdims(
