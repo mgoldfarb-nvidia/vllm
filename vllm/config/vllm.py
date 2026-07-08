@@ -245,10 +245,7 @@ OPTIMIZATION_LEVEL_01 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
-        # illegal memory access on GB300 (SM103); keep autotune off (the
-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
-        "enable_flashinfer_autotune": False,
+        "enable_flashinfer_autotune": True,
     },
 }
 OPTIMIZATION_LEVEL_02 = {
@@ -271,10 +268,7 @@ OPTIMIZATION_LEVEL_02 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
-        # illegal memory access on GB300 (SM103); keep autotune off (the
-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
-        "enable_flashinfer_autotune": False,
+        "enable_flashinfer_autotune": True,
     },
 }
 OPTIMIZATION_LEVEL_03 = {
@@ -297,10 +291,7 @@ OPTIMIZATION_LEVEL_03 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
-        # FlashInfer 0.6.12's trtllm_fp4_block_scale_moe autotuner triggers an
-        # illegal memory access on GB300 (SM103); keep autotune off (the
-        # pre-#42857 default) until flashinfer-ai/flashinfer#3197 is fixed.
-        "enable_flashinfer_autotune": False,
+        "enable_flashinfer_autotune": True,
     },
 }
 
