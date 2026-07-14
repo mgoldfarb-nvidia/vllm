@@ -16,8 +16,12 @@ if(FMHA_SM100_SRC_DIR)
 else()
   FetchContent_Declare(
     fmha_sm100
-    GIT_REPOSITORY https://github.com/vllm-project/MSA.git
-    GIT_TAG 2e63ec37a0fc29bc20f39cd1a52e0f5affc33a73
+    # Fork of vllm-project/MSA @ fee7831 + the sm_100f family gencode target so
+    # the JIT'd fmha_sm100 kernels have an image for SM107 (VR200); upstream only
+    # ships sm_100a/sm_103a, which fails on cc 10.7 with "no kernel image is
+    # available for execution on the device". Revert to upstream once merged.
+    GIT_REPOSITORY https://gitlab-master.nvidia.com/zaristei/MSA.git
+    GIT_TAG afc1981b8a1b792a30b1c284732d4545d8efb118
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
