@@ -1,12 +1,23 @@
 include(FetchContent)
 
-# If FMHA_SM100_SRC_DIR is set, fmha_sm100 is installed from that directory
-# instead of downloading. This is useful for local MSA development.
+# fmha_sm100 source, in preference order:
+#   1. FMHA_SM100_SRC_DIR env var  — explicit local MSA checkout (dev override)
+#   2. third_party/MSA submodule   — vendored fork of vllm-project/MSA @ fee7831
+#      plus the sm_100f family gencode target, so the JIT'd fmha_sm100 kernels
+#      have an image for SM107 (VR200). Upstream only ships sm_100a/sm_103a,
+#      which fails on cc 10.7 with "no kernel image is available for execution
+#      on the device". The submodule is fetched at (authenticated) CI checkout
+#      time, so the credential-less wheel build never has to clone it.
+#   3. upstream github  — anonymous clone fallback for envs without the
+#      submodule (e.g. non-SM107 dev); lacks the sm_100f fix.
 if(DEFINED ENV{FMHA_SM100_SRC_DIR})
   set(FMHA_SM100_SRC_DIR $ENV{FMHA_SM100_SRC_DIR})
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/MSA/python/fmha_sm100/jit.py")
+  set(FMHA_SM100_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/MSA")
 endif()
 
 if(FMHA_SM100_SRC_DIR)
+  message(STATUS "fmha_sm100 using local source: ${FMHA_SM100_SRC_DIR}")
   FetchContent_Declare(
     fmha_sm100
     SOURCE_DIR ${FMHA_SM100_SRC_DIR}
@@ -21,7 +32,7 @@ else()
     # ships sm_100a/sm_103a, which fails on cc 10.7 with "no kernel image is
     # available for execution on the device". Revert to upstream once merged.
     GIT_REPOSITORY https://gitlab-master.nvidia.com/zaristei/MSA.git
-    GIT_TAG afc1981b8a1b792a30b1c284732d4545d8efb118
+    GIT_TAG 12d9ca91be380b444e384b3b101ea5ba44d01396.
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""

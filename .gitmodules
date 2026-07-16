@@ -1,0 +1,4 @@
+[submodule "third_party/MSA"]
+	path = third_party/MSA
+	url = ../../../zaristei/MSA.git
+	branch = rubin-sm107-sm100f
