@@ -3,6 +3,7 @@
 import copy
 import os
 import threading
+import time
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -44,6 +45,32 @@ else:
     ActorHandle = None
 
 logger = init_logger(__name__)
+
+# Bounded window granted to worker processes after their actor death is
+# registered: exit_actor() reports death to the GCS before the worker
+# process has finished interpreter finalization, and if the driver exits
+# immediately the raylet's owner-death cleanup can SIGKILL workers mid
+# teardown. Profilers, coverage tools, and binary instrumentation (e.g.
+# BOLT) flush their data from atexit/C-level finalizers in that window.
+RAY_WORKER_EXIT_DRAIN_S = 20.0
+
+
+def _exit_actor_gracefully(worker) -> None:
+    """Exit the current RayWorkerProc actor from inside its busy loop.
+
+    Dispatched to every worker through the rpc broadcast queue as a
+    cloudpickled callable. ray.actor.exit_actor() raises SystemExit, which
+    deliberately escapes the busy loop's `except Exception`; it unwinds
+    through RayWorkerProc.run(), whose `finally` clause performs the full
+    WorkerProc.shutdown() (destroying process groups while the head node's
+    TCPStore is still alive), and Ray then treats the exit as intentional.
+    The worker process terminates through normal interpreter finalization,
+    so atexit handlers and C-level finalizers can run -- ray.kill() would
+    SIGKILL the process and skip all of that.
+    """
+    import ray
+
+    ray.actor.exit_actor()
 
 
 @dataclass
@@ -558,12 +585,31 @@ class RayExecutorV2(MultiprocExecutor):
 
         self._join_monitor_thread()
 
-        for handle in getattr(self, "ray_worker_handles", []):
+        handles = getattr(self, "ray_worker_handles", []) or []
+        if handles:
             try:
-                ray.kill(handle.actor)
-                logger.debug("Killed actor rank=%d", handle.rank)
+                # non_block: exiting workers never enqueue a response, so a
+                # blocking collective_rpc would hang forever.
+                self.collective_rpc(_exit_actor_gracefully, non_block=True)
             except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+                logger.exception("Failed to dispatch graceful worker exit")
+            refs = [handle.actor.__ray_terminate__.remote() for handle in handles]
+            _, not_ready = ray.wait(refs, num_returns=len(refs), timeout=15)
+            if not_ready:
+                logger.warning(
+                    "%d Ray workers did not exit gracefully within 15s; "
+                    "force-killing them",
+                    len(not_ready),
+                )
+                for handle in handles:
+                    try:
+                        ray.kill(handle.actor)
+                    except Exception:
+                        logger.exception(
+                            "Failed to kill actor rank=%d", handle.rank
+                        )
+            else:
+                time.sleep(RAY_WORKER_EXIT_DRAIN_S)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
