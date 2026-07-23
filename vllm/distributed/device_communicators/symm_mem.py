@@ -27,6 +27,7 @@ class SymmMemCommunicator:
         "9.0": [4, 6, 8],
         "10.0": [6, 8],
         "10.3": [6, 8],
+        "10.7": [6, 8],  # VR200 NVL72 (sm_107)
     }
 
     def __init__(
