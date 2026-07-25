@@ -1297,15 +1297,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
-        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
+        if self.start_layer >= self.end_layer:
             return
-        layer = self.layers[self.start_layer]
-        if isinstance(layer, DeepseekV4DecoderLayer):
-            layer.hc_attn_fn_broadcast = (
-                layer.hc_attn_fn.detach()
-                .view(-1, layer.hc_mult, layer.hidden_size)
-                .sum(dim=1)
-            )
+        # Upstream #48137 populates hc_attn_fn_broadcast on a single layer of
+        # the first PP rank, which is correct only for -dp N -ep configs. Under
+        # TP-only sharding a rank owns many contiguous layers and the forward
+        # asserts on hc_attn_fn_broadcast, so populate it on every owned layer.
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.hc_attn_fn_broadcast = (
+                    layer.hc_attn_fn.detach()
+                    .view(-1, layer.hc_mult, layer.hidden_size)
+                    .sum(dim=1)
+                )
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
