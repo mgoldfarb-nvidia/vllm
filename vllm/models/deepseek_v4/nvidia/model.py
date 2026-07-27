@@ -879,6 +879,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             # Run standalone mhc_pre on first layer
             if x.dim() == 2:
+                # Upstream #48137 populates hc_attn_fn_broadcast via
+                # finalize_mhc_broadcast_weights, which is only called from the
+                # DeepseekV4ForCausalLM.load_weights outer wrapper. Internal
+                # container quantized-checkpoint loaders (FP8/NVFP4) reach the
+                # inner DeepseekV4Model.load_weights directly and skip the
+                # populator, so lazy-initialize here to cover every path.
+                if self.hc_attn_fn_broadcast is None:
+                    self.hc_attn_fn_broadcast = (
+                        self.hc_attn_fn.detach()
+                        .view(-1, self.hc_mult, self.hidden_size)
+                        .sum(dim=1)
+                    )
                 assert self.hc_attn_fn_broadcast is not None
                 residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
                     x,
