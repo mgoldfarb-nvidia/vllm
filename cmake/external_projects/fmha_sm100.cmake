@@ -8,8 +8,8 @@ include(FetchContent)
 #      which fails on cc 10.7 with "no kernel image is available for execution
 #      on the device". The submodule is fetched at (authenticated) CI checkout
 #      time, so the credential-less wheel build never has to clone it.
-#   3. upstream github  — anonymous clone fallback for envs without the
-#      submodule (e.g. non-SM107 dev); lacks the sm_100f fix.
+#   3. GIT_REPOSITORY clone of the same fork — fallback for envs without the
+#      submodule checked out; needs gitlab-master credentials.
 if(DEFINED ENV{FMHA_SM100_SRC_DIR})
   set(FMHA_SM100_SRC_DIR $ENV{FMHA_SM100_SRC_DIR})
 elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/MSA/python/fmha_sm100/jit.py")
@@ -32,7 +32,7 @@ else()
     # ships sm_100a/sm_103a, which fails on cc 10.7 with "no kernel image is
     # available for execution on the device". Revert to upstream once merged.
     GIT_REPOSITORY https://gitlab-master.nvidia.com/zaristei/MSA.git
-    GIT_TAG 12d9ca91be380b444e384b3b101ea5ba44d01396.
+    GIT_TAG 12d9ca91be380b444e384b3b101ea5ba44d01396
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
