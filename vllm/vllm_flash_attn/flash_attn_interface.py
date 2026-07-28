@@ -398,7 +398,7 @@ def flash_attn_varlen_func(
         if output_scale is not None:
             fa4_extra["output_scale"] = output_scale
 
-        out, softmax_lse = _flash_attn_fwd(
+        out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
             v,
