@@ -159,38 +159,6 @@ def kernel_warmup(worker: "Worker"):
         cutedsl_warmup()
 
 
-# Device capabilities where the CuTe-DSL mm_fp4 heuristic fallback is NOT a
-# competitive stand-in for the autotuned tactic, so fp4_gemm autotuning must
-# stay on despite the warmup cost.
-#
-# Upstream #48268 skips fp4_gemm autotuning whenever the CuTe-DSL NVFP4 linear
-# kernel is selected, on the basis that "its fallback is already the analytical
-# heuristic" -- validated on B300 (SM103) with Qwen3.5-35B, where it saves 7+
-# minutes of warmup for no measurable runtime cost. That equivalence does not
-# hold on SM107 (Rubin/VR200): the untuned heuristic loses badly on the skinny
-# GEMMs that dominate low-concurrency decode.
-#
-# Measured on VR200, llama3.3-70b NVFP4, TP4, isl1000/osl1000, dummy weights:
-#     con1    85.8 -> 133.9 tok/s   (1.56x)
-#     con16                          (1.44x)
-# matching the core-models nightly regression on nightly-vr200nvl-inference
-# (con1 206.5 -> 142.5 tok/s, -31%) that appeared when rubin-devel rebased onto
-# vLLM v0.26.0 and first picked up #48268. con64/con128 are unaffected, which is
-# the expected shape: tactic choice only matters while the GEMM is skinny.
-_CUTEDSL_FP4_HEURISTIC_UNTRUSTED_CAPABILITIES = frozenset({(10, 7)})
-
-
-def _cutedsl_fp4_heuristic_is_trusted() -> bool:
-    """Whether the CuTe-DSL mm_fp4 heuristic fallback is good enough here."""
-    capability = current_platform.get_device_capability()
-    if capability is None:
-        return True
-    return (
-        capability.major,
-        capability.minor,
-    ) not in _CUTEDSL_FP4_HEURISTIC_UNTRUSTED_CAPABILITIES
-
-
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     if envs.VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS is not None:
         return set(envs.VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS) or None
@@ -206,17 +174,6 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
             # fallback is already the heuristic; all mm_fp4 backends share
             # the "fp4_gemm" op name, so skip only when cute-dsl is selected.
             if isinstance(kernel, FlashInferCuteDslNvFp4LinearKernel):
-                if not _cutedsl_fp4_heuristic_is_trusted():
-                    logger.info(
-                        "Keeping fp4_gemm autotuning enabled: the CuTe-DSL "
-                        "heuristic fallback is not competitive on device "
-                        "capability %s. This costs extra warmup time but "
-                        "avoids a large low-concurrency decode regression. "
-                        "Set VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS=fp4_gemm to "
-                        "restore the upstream default.",
-                        current_platform.get_device_capability(),
-                    )
-                    return None
                 return {"fp4_gemm"}
     return None
 
