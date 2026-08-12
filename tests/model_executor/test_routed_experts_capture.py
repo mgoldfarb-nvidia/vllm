@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import types
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,7 +11,11 @@ import torch
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    ExpertLayerPlacement,
+    ExpertRoutingStatsRecorder,
+    ExpertRoutingStep,
     RoutedExpertsCapturer,
+    summarize_expert_routing,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
@@ -64,6 +69,98 @@ def _make_router(eplb_state: EplbLayerState | None = None) -> DummyRouter:
         global_num_experts=16,
         eplb_state=eplb_state,
     )
+
+
+def _make_modular_routed_experts():
+    return types.SimpleNamespace(
+        global_num_experts=16,
+        expert_map_manager=types.SimpleNamespace(
+            get_local_expert_ids=lambda: list(range(16)),
+            placement_strategy="linear",
+        ),
+    )
+
+
+def test_summarize_expert_routing_uses_actual_local_placement():
+    routing_data = torch.tensor(
+        [
+            [[0, 1], [3, 3]],
+            [[2, 2], [1, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    step = ExpertRoutingStep(decode_step=7, num_reqs=2, routing_data=routing_data)
+    placements = (
+        ExpertLayerPlacement(0, 4, (0, 2), "round_robin"),
+        ExpertLayerPlacement(1, 4, (1, 3), "round_robin"),
+    )
+
+    summary = summarize_expert_routing(step, placements)
+
+    assert summary == {
+        "record_type": "decode_step",
+        "decode_step": 7,
+        "num_reqs": 2,
+        "num_scheduled_tokens": 2,
+        "layers": [
+            {"layer_id": 0, "local_tokens_per_expert": [1, 2]},
+            {"layer_id": 1, "local_tokens_per_expert": [1, 2]},
+        ],
+    }
+
+
+def test_expert_routing_stats_recorder_writes_complete_window(tmp_path):
+    recorder = ExpertRoutingStatsRecorder(
+        global_rank=3,
+        layer_placements=(ExpertLayerPlacement(0, 4, (0, 1), "linear"),),
+        top_k=2,
+    )
+
+    path = recorder.begin(str(tmp_path), iteration=5)
+    recorder.submit(
+        num_reqs=2,
+        routing_data=torch.tensor([[[0, 1]], [[1, 3]]], dtype=torch.int32),
+    )
+    result = recorder.finish()
+
+    assert result == {"status": "complete", "decode_steps": 1, "path": path}
+    with open(path, encoding="utf-8") as stats_file:
+        records = [json.loads(line) for line in stats_file]
+    assert [record["record_type"] for record in records] == [
+        "metadata",
+        "decode_step",
+        "summary",
+    ]
+    assert records[0]["global_rank"] == 3
+    assert records[1]["layers"][0]["local_tokens_per_expert"] == [1, 2]
+    assert records[2] == {
+        "record_type": "summary",
+        "status": "complete",
+        "decode_steps": 1,
+    }
+
+
+def test_expert_routing_stats_recorder_waits_for_async_copy(tmp_path):
+    recorder = ExpertRoutingStatsRecorder(
+        global_rank=1,
+        layer_placements=(ExpertLayerPlacement(0, 4, (0, 1), "linear"),),
+        top_k=2,
+    )
+    routing_data = torch.zeros((1, 1, 2), dtype=torch.int32)
+    ready_event = SimpleNamespace(synchronize=lambda: routing_data.fill_(1))
+
+    path = recorder.begin(str(tmp_path), iteration=2)
+    recorder.submit(
+        num_reqs=1,
+        routing_data=routing_data,
+        ready_event=ready_event,
+        source_tensor=torch.empty(0),
+    )
+    recorder.finish()
+
+    with open(path, encoding="utf-8") as stats_file:
+        records = [json.loads(line) for line in stats_file]
+    assert records[1]["layers"][0]["local_tokens_per_expert"] == [0, 2]
 
 
 def test_base_router_capture_pre_eplb_mapping():
@@ -122,6 +219,7 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
         def __init__(self):
             self.layer_id = 7
             self.router = _make_router()
+            self.routed_experts = _make_modular_routed_experts()
 
     class DummyCapturer:
         def __init__(self):
@@ -160,6 +258,7 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
         def __init__(self):
             self.layer_id = 11
             self.router = _make_router()
+            self.routed_experts = _make_modular_routed_experts()
 
     class DummyCapturer:
         def __init__(self):
@@ -197,6 +296,7 @@ def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
         def __init__(self, layer_id):
             self.layer_id = layer_id
             self.router = _make_router()
+            self.routed_experts = _make_modular_routed_experts()
 
     target_module = DummyFusedMoE(layer_id=7)
     draft_module = DummyFusedMoE(layer_id=0)

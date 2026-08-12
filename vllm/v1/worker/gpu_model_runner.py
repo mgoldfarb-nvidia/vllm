@@ -46,6 +46,7 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
@@ -60,6 +61,9 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    ExpertLayerPlacement,
+    ExpertRoutingStatsRecorder,
+    ExpertRoutingStatsTensors,
     RoutedExpertsCapturer,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -265,6 +269,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        expert_routing_stats: ExpertRoutingStatsTensors | None = None,
+        expert_routing_stats_recorder: ExpertRoutingStatsRecorder | None = None,
         check_ep_fault: bool = False,
     ):
         self._model_runner_output = model_runner_output
@@ -280,6 +286,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
+        self._expert_routing_stats = expert_routing_stats
         self._has_fault: torch.Tensor | None = None
 
         # Initiate the copy on a separate stream, but do not synchronize it.
@@ -299,10 +306,25 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._routed_experts is not None
                 else None
             )
+            self._expert_routing_stats_cpu = (
+                self._expert_routing_stats.to_cpu_nonblocking()
+                if self._expert_routing_stats is not None
+                else None
+            )
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
+
+        if self._expert_routing_stats_cpu is not None:
+            assert expert_routing_stats_recorder is not None
+            assert self._expert_routing_stats is not None
+            expert_routing_stats_recorder.submit(
+                num_reqs=self._expert_routing_stats_cpu.num_reqs,
+                routing_data=self._expert_routing_stats_cpu.routing_data,
+                ready_event=self.async_copy_ready_event,
+                source_tensor=self._expert_routing_stats.routing_data,
+            )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
@@ -337,6 +359,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._routed_experts_cpu is not None:
             output.routed_experts = self._routed_experts_cpu.tolists()
         del self._routed_experts
+
+        del self._expert_routing_stats
 
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
@@ -495,6 +519,8 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        self.expert_routing_stats_recorder: ExpertRoutingStatsRecorder | None = None
+        self._pending_expert_routing_stats: ExpertRoutingStatsTensors | None = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -2321,7 +2347,7 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
-        if self.routed_experts_initialized:
+        if self.model_config.enable_return_routed_experts:
             # Copy this step's attention slot_mapping into our private
             # device buffer. The shared ``slot_mappings[attn_gid]`` is
             # owned by the attention block table and will be overwritten
@@ -3711,13 +3737,26 @@ class GPUModelRunner(
             # waits for every D2H queued on the default stream since
             # the last sync, so this enqueue is naturally covered
             # without requiring its own synchronize.
-            if self.routed_experts_initialized:
+            if self.model_config.enable_return_routed_experts:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
                 self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
                 self.routed_experts_slot_mapping_cpu[:total].copy_(
                     self.routed_experts_slot_mapping_device[:total],
                     non_blocking=True,
+                )
+
+            self._pending_expert_routing_stats = None
+            if self._should_capture_expert_routing_stats(scheduler_output):
+                buf = self.routed_experts_capturer.get_device_buffer()
+                total = scheduler_output.total_num_scheduled_tokens
+                routing_data = torch.empty_like(
+                    buf[:total], device="cpu", pin_memory=PIN_MEMORY
+                )
+                routing_data.copy_(buf[:total], non_blocking=True)
+                self._pending_expert_routing_stats = ExpertRoutingStatsTensors(
+                    routing_data=routing_data,
+                    num_reqs=len(scheduler_output.num_scheduled_tokens),
                 )
 
             # Get the valid generated tokens.
@@ -4119,7 +4158,7 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if self.routed_experts_initialized:
+        if self.model_config.enable_return_routed_experts:
             self.routed_experts_capturer.clear_buffer()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
@@ -4724,7 +4763,7 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
-            if self.routed_experts_initialized:
+            if self.model_config.enable_return_routed_experts:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
                 # the pinned buffers are ready to be wrapped as numpy.
@@ -4733,6 +4772,13 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            if self._pending_expert_routing_stats is not None:
+                assert self.expert_routing_stats_recorder is not None
+                self.expert_routing_stats_recorder.submit(
+                    num_reqs=self._pending_expert_routing_stats.num_reqs,
+                    routing_data=self._pending_expert_routing_stats.routing_data,
+                )
+                self._pending_expert_routing_stats = None
             return output
 
         with record_function_or_nullcontext(
@@ -4751,7 +4797,7 @@ class GPUModelRunner(
             #     stream.
             # Without clones, the copy stream would read torn data.
             routed_experts_snapshot = None
-            if self.routed_experts_initialized:
+            if self.model_config.enable_return_routed_experts:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
                 routed_experts_snapshot = RoutedExpertsTensors(
@@ -4759,6 +4805,15 @@ class GPUModelRunner(
                     slot_mapping=self.routed_experts_slot_mapping_device[
                         :total
                     ].clone(),
+                )
+
+            expert_routing_stats_snapshot = None
+            if self._should_capture_expert_routing_stats(scheduler_output):
+                buf = self.routed_experts_capturer.get_device_buffer()
+                total = scheduler_output.total_num_scheduled_tokens
+                expert_routing_stats_snapshot = ExpertRoutingStatsTensors(
+                    routing_data=buf[:total].clone(),
+                    num_reqs=len(scheduler_output.num_scheduled_tokens),
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -4769,6 +4824,8 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
+                expert_routing_stats=expert_routing_stats_snapshot,
+                expert_routing_stats_recorder=self.expert_routing_stats_recorder,
                 check_ep_fault=self.check_ep_fault,
             )
         with record_function_or_nullcontext(
@@ -7632,17 +7689,39 @@ class GPUModelRunner(
                 return gid
         return 0
 
-    def init_routed_experts_capturer(self):
+    def init_routed_experts_capturer(self) -> None:
+        capture_stats = envs.VLLM_EXPERT_ROUTING_STATS
+        if capture_stats and self.parallel_config.enable_eplb:
+            raise ValueError(
+                "VLLM_EXPERT_ROUTING_STATS does not support dynamic expert "
+                "placement (EPLB)"
+            )
         logger.info(
-            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            "Initializing routed experts capturer: "
+            "enable_return_routed_experts=%s, expert_routing_stats=%s",
             self.model_config.enable_return_routed_experts,
+            capture_stats,
         )
         self.routed_experts_capturer = RoutedExpertsCapturer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             vllm_config=self.vllm_config,
         )
+        layer_placements = self._bind_routed_experts_capturer(
+            self.routed_experts_capturer
+        )
+
+        if capture_stats:
+            self.expert_routing_stats_recorder = ExpertRoutingStatsRecorder(
+                global_rank=get_world_group().rank,
+                layer_placements=layer_placements,
+                top_k=self.routed_experts_capturer.device_buffer.shape[2],
+            )
+
+        if not self.model_config.enable_return_routed_experts:
+            self.routed_experts_initialized = True
+            return
+
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        self._bind_routed_experts_capturer(self.routed_experts_capturer)
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on
         # the sync scheduling path. Shape / dtype mirror the device
@@ -7674,20 +7753,77 @@ class GPUModelRunner(
         )
         self.routed_experts_initialized = True
 
-    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
+    def _bind_routed_experts_capturer(
+        self, capturer: RoutedExpertsCapturer
+    ) -> tuple[ExpertLayerPlacement, ...]:
         from vllm.model_executor.layers.fused_moe.layer import MoERunner
         from vllm.model_executor.layers.fused_moe.router.base_router import (
             BaseRouter,
         )
 
+        placements: dict[int, ExpertLayerPlacement] = {}
         for module in self.model.modules():
-            if isinstance(module, MoERunner) and isinstance(module.router, BaseRouter):
-                layer_id = module.layer_id
+            if not isinstance(module, MoERunner):
+                continue
+            if not isinstance(module.router, BaseRouter):
+                if envs.VLLM_EXPERT_ROUTING_STATS:
+                    raise ValueError(
+                        "Expert routing statistics are not supported with router "
+                        f"{type(module.router).__name__}"
+                    )
+                continue
+            layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+            def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
+                _capturer.capture(_layer_id, topk_ids)
 
-                module.router.set_capture_fn(_capture_fn)
+            module.router.set_capture_fn(_capture_fn)
+
+            routed_experts = module.routed_experts
+            expert_map_manager = routed_experts.expert_map_manager
+            placement = ExpertLayerPlacement(
+                layer_id=layer_id,
+                global_num_experts=routed_experts.global_num_experts,
+                local_expert_ids=tuple(expert_map_manager.get_local_expert_ids()),
+                placement_strategy=expert_map_manager.placement_strategy,
+            )
+            previous = placements.setdefault(layer_id, placement)
+            if previous != placement:
+                raise ValueError(
+                    f"MoE layer {layer_id} has inconsistent expert placements"
+                )
+
+        return tuple(placements[layer_id] for layer_id in sorted(placements))
+
+    def _should_capture_expert_routing_stats(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        recorder = self.expert_routing_stats_recorder
+        scheduled_tokens = scheduler_output.num_scheduled_tokens.values()
+        return (
+            recorder is not None
+            and recorder.active
+            and bool(scheduler_output.num_scheduled_tokens)
+            and all(num_tokens == 1 for num_tokens in scheduled_tokens)
+        )
+
+    def begin_expert_routing_stats(self, output_dir: str, iteration: int) -> str:
+        if self.expert_routing_stats_recorder is None:
+            raise RuntimeError(
+                "Expert routing statistics are unavailable; set "
+                "VLLM_EXPERT_ROUTING_STATS=1 before worker initialization"
+            )
+        return self.expert_routing_stats_recorder.begin(output_dir, iteration)
+
+    def finish_expert_routing_stats(self) -> dict[str, Any]:
+        if self.expert_routing_stats_recorder is None:
+            return {"status": "disabled", "decode_steps": 0, "path": None}
+        return self.expert_routing_stats_recorder.finish()
+
+    def abort_expert_routing_stats(self) -> dict[str, Any]:
+        if self.expert_routing_stats_recorder is None:
+            return {"status": "disabled", "decode_steps": 0, "path": None}
+        return self.expert_routing_stats_recorder.abort()
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

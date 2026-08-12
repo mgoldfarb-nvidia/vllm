@@ -5,7 +5,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import queue
+import threading
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -17,6 +23,218 @@ from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_ROUTING_STATS_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ExpertLayerPlacement:
+    """Static logical-to-local expert placement for one MoE layer."""
+
+    layer_id: int
+    global_num_experts: int
+    local_expert_ids: tuple[int, ...]
+    placement_strategy: str
+
+
+@dataclass(frozen=True)
+class ExpertRoutingStep:
+    """One pure-decode routing snapshot waiting for CPU aggregation."""
+
+    decode_step: int
+    num_reqs: int
+    routing_data: torch.Tensor
+    ready_event: torch.cuda.Event | None = None
+    # Retain the CUDA allocation until its asynchronous D2H copy completes.
+    source_tensor: torch.Tensor | None = None
+
+
+class ExpertRoutingStatsTensors(NamedTuple):
+    """A device snapshot and the scheduler metadata needed to summarize it."""
+
+    routing_data: torch.Tensor
+    num_reqs: int
+
+    def to_cpu_nonblocking(self) -> ExpertRoutingStatsTensors:
+        if self.routing_data.device.type == "cpu":
+            return self
+        return ExpertRoutingStatsTensors(
+            routing_data=self.routing_data.to("cpu", non_blocking=True),
+            num_reqs=self.num_reqs,
+        )
+
+
+def summarize_expert_routing(
+    step: ExpertRoutingStep,
+    layer_placements: tuple[ExpertLayerPlacement, ...],
+) -> dict[str, Any]:
+    """Summarize exact local expert occupancy for one decode step."""
+    if step.ready_event is not None:
+        step.ready_event.synchronize()
+    routing_data = step.routing_data.numpy()
+    layers = []
+    for placement in layer_placements:
+        expert_ids = routing_data[:, placement.layer_id, :].reshape(-1)
+        valid_ids = expert_ids[
+            (expert_ids >= 0) & (expert_ids < placement.global_num_experts)
+        ]
+        global_counts = np.bincount(
+            valid_ids.astype(np.int64), minlength=placement.global_num_experts
+        )
+        local_counts = global_counts[np.asarray(placement.local_expert_ids)]
+        layers.append(
+            {
+                "layer_id": placement.layer_id,
+                "local_tokens_per_expert": local_counts.tolist(),
+            }
+        )
+
+    return {
+        "record_type": "decode_step",
+        "decode_step": step.decode_step,
+        "num_reqs": step.num_reqs,
+        "num_scheduled_tokens": routing_data.shape[0],
+        "layers": layers,
+    }
+
+
+class ExpertRoutingStatsRecorder:
+    """Writes per-decode expert occupancy without blocking model execution."""
+
+    def __init__(
+        self,
+        *,
+        global_rank: int,
+        layer_placements: tuple[ExpertLayerPlacement, ...],
+        top_k: int,
+    ) -> None:
+        if not layer_placements:
+            raise ValueError("Expert routing statistics require at least one MoE layer")
+        self._global_rank = global_rank
+        self._layer_placements = layer_placements
+        self._top_k = top_k
+        self._queue: queue.SimpleQueue[ExpertRoutingStep | str] | None = None
+        self._thread: threading.Thread | None = None
+        self._writer_error: BaseException | None = None
+        self._path: Path | None = None
+        self._decode_steps = 0
+
+    @property
+    def active(self) -> bool:
+        return self._queue is not None
+
+    def begin(self, output_dir: str, iteration: int) -> str:
+        if self.active:
+            raise RuntimeError("Expert routing statistics window is already active")
+        self._raise_writer_error()
+
+        stats_dir = Path(output_dir) / "expert-routing-stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        path = stats_dir / (
+            f"expert-routing-rank-{self._global_rank}-iteration-{iteration}.jsonl"
+        )
+        metadata = {
+            "record_type": "metadata",
+            "schema_version": _EXPERT_ROUTING_STATS_SCHEMA_VERSION,
+            "iteration": iteration,
+            "global_rank": self._global_rank,
+            "top_k": self._top_k,
+            "layers": [asdict(layer) for layer in self._layer_placements],
+        }
+        with path.open("x", encoding="utf-8") as output:
+            output.write(json.dumps(metadata, separators=(",", ":")) + "\n")
+
+        self._path = path
+        self._decode_steps = 0
+        self._queue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._write_steps,
+            name=f"expert-routing-stats-rank-{self._global_rank}",
+            daemon=True,
+        )
+        self._thread.start()
+        return str(path)
+
+    def submit(
+        self,
+        num_reqs: int,
+        routing_data: torch.Tensor,
+        *,
+        ready_event: torch.cuda.Event | None = None,
+        source_tensor: torch.Tensor | None = None,
+    ) -> None:
+        if self._queue is None:
+            return
+        self._raise_writer_error()
+        step = ExpertRoutingStep(
+            decode_step=self._decode_steps,
+            num_reqs=num_reqs,
+            routing_data=routing_data,
+            ready_event=ready_event,
+            source_tensor=source_tensor,
+        )
+        self._decode_steps += 1
+        self._queue.put(step)
+
+    def finish(self) -> dict[str, Any]:
+        return self._close("complete")
+
+    def abort(self) -> dict[str, Any]:
+        return self._close("aborted")
+
+    def _close(self, status: str) -> dict[str, Any]:
+        if self._queue is None or self._thread is None or self._path is None:
+            return {"status": "inactive", "decode_steps": 0, "path": None}
+        self._queue.put(status)
+        self._thread.join()
+        path = self._path
+        decode_steps = self._decode_steps
+        self._queue = None
+        self._thread = None
+        self._path = None
+        self._raise_writer_error()
+        return {
+            "status": status,
+            "decode_steps": decode_steps,
+            "path": str(path),
+        }
+
+    def _write_steps(self) -> None:
+        assert self._queue is not None
+        assert self._path is not None
+        try:
+            with self._path.open("a", encoding="utf-8") as output:
+                while True:
+                    item = self._queue.get()
+                    if isinstance(item, str):
+                        output.write(
+                            json.dumps(
+                                {
+                                    "record_type": "summary",
+                                    "status": item,
+                                    "decode_steps": self._decode_steps,
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
+                        return
+                    output.write(
+                        json.dumps(
+                            summarize_expert_routing(item, self._layer_placements),
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+        except BaseException as error:
+            self._writer_error = error
+
+    def _raise_writer_error(self) -> None:
+        if self._writer_error is None:
+            return
+        error = self._writer_error
+        self._writer_error = None
+        raise RuntimeError("Failed to write expert routing statistics") from error
 
 
 def _get_num_experts_per_tok(hf_config) -> int:

@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+    VLLM_EXPERT_ROUTING_STATS: bool = False
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
@@ -912,6 +913,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (MQ-based) instead of RayDistributedExecutor (compiled-graph backend).
     "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": lambda: bool(
         int(os.getenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1"))
+    ),
+    # Capture exact per-layer local expert occupancy during explicit
+    # correlation windows. Disabled by default because it adds one small
+    # route-buffer copy per pure-decode step while a window is active.
+    "VLLM_EXPERT_ROUTING_STATS": lambda: bool(
+        int(os.getenv("VLLM_EXPERT_ROUTING_STATS", "0"))
     ),
     # When True, GroupCoordinator constructs its CPU/device subgroups via
     # ``torch.distributed.split_group(backend=...)``
