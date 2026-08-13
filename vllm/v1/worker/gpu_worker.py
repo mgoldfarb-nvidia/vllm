@@ -430,6 +430,12 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        # Statistics capture must be bound before memory profiling triggers
+        # the first torch.compile trace. Allocate outside the weights pool so
+        # the persistent buffer remains valid for CUDA graph replay.
+        if envs.VLLM_EXPERT_ROUTING_STATS:
+            self.model_runner.init_routed_experts_capturer()
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -731,11 +737,14 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if (
-            self.model_config.enable_return_routed_experts
-            or envs.VLLM_EXPERT_ROUTING_STATS
-        ):
+        if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
+        elif envs.VLLM_EXPERT_ROUTING_STATS and not (
+            self.model_runner.routed_experts_initialized
+        ):
+            raise RuntimeError(
+                "Expert routing statistics were not initialized before model warmup"
+            )
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch

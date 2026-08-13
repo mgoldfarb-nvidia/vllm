@@ -75,7 +75,7 @@ class FusedMoERouter(ABC):
         # (set by bind_routing_capture_to_model during capturer init)
         if self._routing_replay_out is not None:
             self._routing_replay_out[: topk_ids.shape[0]].copy_(
-                topk_ids.to(torch.int16)
+                topk_ids.to(self._routing_replay_out.dtype), non_blocking=True
             )
 
         return topk_weights, topk_ids

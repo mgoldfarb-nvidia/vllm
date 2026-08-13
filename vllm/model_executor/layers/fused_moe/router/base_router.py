@@ -185,6 +185,27 @@ class BaseRouter(FusedMoERouter):
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+        if capture_fn is not None:
+            self._routing_replay_out = None
+
+    def set_capture_buffer(self, buffer: torch.Tensor, layer_id: int) -> None:
+        """Bind one layer of the persistent routing capture buffer."""
+        if buffer.ndim != 3:
+            raise ValueError(
+                "Routing capture buffer must have shape (max_tokens, num_layers, top_k)"
+            )
+        if not 0 <= layer_id < buffer.shape[1]:
+            raise ValueError(
+                f"MoE layer {layer_id} is outside routing capture buffer "
+                f"with {buffer.shape[1]} layers"
+            )
+        if buffer.shape[2] != self.top_k:
+            raise ValueError(
+                f"Routing capture top_k mismatch: buffer={buffer.shape[2]}, "
+                f"router={self.top_k}"
+            )
+        self._routing_replay_out = buffer[:, layer_id, :]
+        self.capture_fn = None
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""

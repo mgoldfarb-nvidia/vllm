@@ -4158,7 +4158,10 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if self.model_config.enable_return_routed_experts:
+        if (
+            self.model_config.enable_return_routed_experts
+            or self._should_capture_expert_routing_stats(scheduler_output)
+        ):
             self.routed_experts_capturer.clear_buffer()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
@@ -7691,11 +7694,39 @@ class GPUModelRunner(
 
     def init_routed_experts_capturer(self) -> None:
         capture_stats = envs.VLLM_EXPERT_ROUTING_STATS
+        if self.routed_experts_initialized:
+            raise RuntimeError("Routed experts capturer is already initialized")
+        if capture_stats and self.model_config.enable_return_routed_experts:
+            raise ValueError(
+                "VLLM_EXPERT_ROUTING_STATS cannot be combined with "
+                "enable_return_routed_experts"
+            )
         if capture_stats and self.parallel_config.enable_eplb:
             raise ValueError(
                 "VLLM_EXPERT_ROUTING_STATS does not support dynamic expert "
                 "placement (EPLB)"
             )
+        if capture_stats:
+            if self.parallel_config.use_ubatching:
+                raise ValueError(
+                    "VLLM_EXPERT_ROUTING_STATS does not support microbatching"
+                )
+            unsupported_topology = (
+                self.parallel_config.data_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.prefill_context_parallel_size != 1
+                or self.parallel_config.decode_context_parallel_size != 1
+                or not self.parallel_config.enable_expert_parallel
+            )
+            if unsupported_topology:
+                raise ValueError(
+                    "VLLM_EXPERT_ROUTING_STATS requires DP1/PP1/PCP1/DCP1 "
+                    "with expert parallelism enabled, where EP equals TP"
+                )
+            if self.compilation_config.mode != CompilationMode.VLLM_COMPILE:
+                raise ValueError(
+                    "VLLM_EXPERT_ROUTING_STATS requires CompilationMode.VLLM_COMPILE"
+                )
         logger.info(
             "Initializing routed experts capturer: "
             "enable_return_routed_experts=%s, expert_routing_stats=%s",
@@ -7762,6 +7793,22 @@ class GPUModelRunner(
         )
 
         placements: dict[int, ExpertLayerPlacement] = {}
+        capture_stats = envs.VLLM_EXPERT_ROUTING_STATS
+        if capture_stats:
+
+            def _mark_static(tensor: torch.Tensor) -> None:
+                mark_tensor_static = getattr(
+                    torch.compiler, "cudagraph_mark_tensor_static", None
+                )
+                if mark_tensor_static is not None:
+                    mark_tensor_static(tensor)
+                elif set_static_address_tag := getattr(
+                    torch._C, "_set_static_address_tag", None
+                ):
+                    set_static_address_tag(tensor, True)
+                torch._dynamo.mark_static_address(tensor)
+
+            _mark_static(capturer.device_buffer)
         for module in self.model.modules():
             if not isinstance(module, MoERunner):
                 continue
@@ -7774,10 +7821,21 @@ class GPUModelRunner(
                 continue
             layer_id = module.layer_id
 
-            def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                _capturer.capture(_layer_id, topk_ids)
+            if capture_stats:
+                if module.is_monolithic:
+                    raise ValueError(
+                        "VLLM_EXPERT_ROUTING_STATS does not support monolithic "
+                        f"MoE kernels (layer {layer_id})"
+                    )
+                module.router.set_capture_buffer(capturer.device_buffer, layer_id)
+                assert module.router._routing_replay_out is not None
+                _mark_static(module.router._routing_replay_out)
+            else:
 
-            module.router.set_capture_fn(_capture_fn)
+                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
+                    _capturer.capture(_layer_id, topk_ids)
+
+                module.router.set_capture_fn(_capture_fn)
 
             routed_experts = module.routed_experts
             expert_map_manager = routed_experts.expert_map_manager
@@ -7793,6 +7851,8 @@ class GPUModelRunner(
                     f"MoE layer {layer_id} has inconsistent expert placements"
                 )
 
+        if capture_stats and not placements:
+            raise ValueError("VLLM_EXPERT_ROUTING_STATS found no supported MoE layers")
         return tuple(placements[layer_id] for layer_id in sorted(placements))
 
     def _should_capture_expert_routing_stats(
