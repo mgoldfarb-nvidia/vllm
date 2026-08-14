@@ -27,7 +27,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
 
-_EXPERT_ROUTING_STATS_SCHEMA_VERSION = 2
+_EXPERT_ROUTING_STATS_SCHEMA_VERSION = 3
 _ROUTING_SENTINEL = -1
 _ROUTING_HASH_DOMAIN = b"vllm.expert-routing.v2\0"
 
@@ -246,9 +246,8 @@ def summarize_expert_routing(
             top_k = routing_data.shape[1]
         elif top_k != routing_data.shape[1]:
             raise ValueError("MoE layers have inconsistent top-k dimensions")
-        useful_counts = _local_expert_counts(
-            routing_data[: stats.num_scheduled_tokens], placement
-        )
+        useful_routing_data = routing_data[: stats.num_scheduled_tokens]
+        useful_counts = _local_expert_counts(useful_routing_data, placement)
         physical_counts = _local_expert_counts(routing_data, placement)
         padding_counts = physical_counts - useful_counts
         layers.append(
@@ -256,7 +255,7 @@ def summarize_expert_routing(
                 "layer_id": placement.layer_id,
                 "capture_backend": placement.capture_backend.value,
                 "useful_route_sha256": _routing_sha256(
-                    routing_data[: stats.num_scheduled_tokens],
+                    useful_routing_data,
                     scope="useful",
                     layer_id=placement.layer_id,
                     num_scheduled_tokens=stats.num_scheduled_tokens,
@@ -265,6 +264,20 @@ def summarize_expert_routing(
                 "physical_route_sha256": _routing_sha256(
                     routing_data,
                     scope="physical",
+                    layer_id=placement.layer_id,
+                    num_scheduled_tokens=stats.num_scheduled_tokens,
+                    num_physical_tokens=stats.num_physical_tokens,
+                ),
+                "useful_route_set_sha256": _routing_sha256(
+                    np.sort(useful_routing_data, axis=1),
+                    scope="useful_set",
+                    layer_id=placement.layer_id,
+                    num_scheduled_tokens=stats.num_scheduled_tokens,
+                    num_physical_tokens=stats.num_physical_tokens,
+                ),
+                "physical_route_set_sha256": _routing_sha256(
+                    np.sort(routing_data, axis=1),
+                    scope="physical_set",
                     layer_id=placement.layer_id,
                     num_scheduled_tokens=stats.num_scheduled_tokens,
                     num_physical_tokens=stats.num_physical_tokens,

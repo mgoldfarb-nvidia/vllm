@@ -168,6 +168,12 @@ def test_summarize_expert_routing_separates_useful_and_physical_assignments():
                 "physical_route_sha256": (
                     "03815bae958156ebf478b19fa21d8715629510990286d68ede0805a04ceafbd5"
                 ),
+                "useful_route_set_sha256": (
+                    "332e0b203681f1936a290ce65012a50289f5a36670d07c0ad19b1ed58c02cf54"
+                ),
+                "physical_route_set_sha256": (
+                    "fff3bbe5cb92c7c7b6799a9899c22c526d59fd9dc137aa0ca395f74499baf864"
+                ),
                 "useful_local_assignments_per_expert": [1, 1],
                 "physical_local_assignments_per_expert": [1, 2],
                 "padding_local_assignments_per_expert": [0, 1],
@@ -180,6 +186,12 @@ def test_summarize_expert_routing_separates_useful_and_physical_assignments():
                 ),
                 "physical_route_sha256": (
                     "725a3a7d64f1a9c722a09a45e533ca2b4de22ab0b3cb62599212f7791237af6f"
+                ),
+                "useful_route_set_sha256": (
+                    "a52dc7ddec9f13ed0625975bc241d06d17cc52f8cabda403937701a68a21315e"
+                ),
+                "physical_route_set_sha256": (
+                    "fddf9438f1bc328f1cbeb618be88f6c928d1425ea6741f97af993edfe27e085b"
                 ),
                 "useful_local_assignments_per_expert": [1, 1],
                 "physical_local_assignments_per_expert": [1, 2],
@@ -241,7 +253,7 @@ def test_expert_routing_stats_recorder_writes_complete_window(tmp_path):
         "summary",
     ]
     assert records[0]["global_rank"] == 3
-    assert records[0]["schema_version"] == 2
+    assert records[0]["schema_version"] == 3
     assert records[0]["capture_backend"] == "vllm_router"
     assert records[0]["layers"][0]["capture_backend"] == "vllm_router"
     assert records[1]["layers"][0]["physical_local_assignments_per_expert"] == [1, 2]
@@ -305,6 +317,43 @@ def test_route_hashes_detect_divergence_hidden_by_local_histograms():
     assert second["physical_route_sha256"] == (
         "7fe332f94aa80e1a5201073d6b5aabc8c973a49c70b973f7e7da4ca0494dea6f"
     )
+    assert first["useful_route_set_sha256"] == (
+        "c86de4fbc09a9be5d0f7d6436de9a8279a749bb9ecb979690c1f37be4ca57b94"
+    )
+    assert first["physical_route_set_sha256"] == (
+        "097832d07cf58bae2612ffc5bbb03429f437d12c613a564bcd1a87b3a84dde0f"
+    )
+    assert second["useful_route_set_sha256"] == (
+        "7cfca9968fe14081cdf6e2420ed8c5f7ff9e24e08b90010de496397395cdc9d2"
+    )
+    assert second["physical_route_set_sha256"] == (
+        "9c65b9258a5f1aae6c119cae56ba237cb401fa851d1a9316fe2d3b68b090f882"
+    )
+
+
+def test_route_set_hashes_ignore_topk_slot_order():
+    placement = ExpertLayerPlacement(0, 4, (0, 1), "linear")
+
+    def summarize(routing_data):
+        stats = ExpertRoutingStatsTensors(
+            modular_routing_data=routing_data[:, None, :],
+            flashinfer_routing_data=None,
+            num_reqs=2,
+            num_scheduled_tokens=2,
+            num_physical_tokens=2,
+        )
+        return summarize_expert_routing(
+            ExpertRoutingStep(decode_step=0, stats=stats),
+            (placement,),
+        )["layers"][0]
+
+    ordered = summarize(torch.tensor([[0, 2], [1, 3]], dtype=torch.int16))
+    permuted = summarize(torch.tensor([[2, 0], [3, 1]], dtype=torch.int64))
+
+    assert ordered["useful_route_sha256"] != permuted["useful_route_sha256"]
+    assert ordered["physical_route_sha256"] != permuted["physical_route_sha256"]
+    assert ordered["useful_route_set_sha256"] == permuted["useful_route_set_sha256"]
+    assert ordered["physical_route_set_sha256"] == permuted["physical_route_set_sha256"]
 
 
 def test_expert_routing_stats_recorder_waits_for_async_copy(tmp_path):
