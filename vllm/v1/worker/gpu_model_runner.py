@@ -62,6 +62,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     ExpertLayerPlacement,
+    ExpertRoutingCaptureBackend,
     ExpertRoutingStatsRecorder,
     ExpertRoutingStatsTensors,
     RoutedExpertsCapturer,
@@ -320,10 +321,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             assert expert_routing_stats_recorder is not None
             assert self._expert_routing_stats is not None
             expert_routing_stats_recorder.submit(
-                num_reqs=self._expert_routing_stats_cpu.num_reqs,
-                routing_data=self._expert_routing_stats_cpu.routing_data,
+                stats=self._expert_routing_stats_cpu,
                 ready_event=self.async_copy_ready_event,
-                source_tensor=self._expert_routing_stats.routing_data,
+                source_tensors=self._expert_routing_stats.source_tensors,
             )
 
     def get_output(self) -> ModelRunnerOutput:
@@ -471,6 +471,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    num_physical_tokens: int
 
 
 class GPUModelRunner(
@@ -3698,6 +3699,7 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
+        num_physical_tokens: int,
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
@@ -3748,15 +3750,13 @@ class GPUModelRunner(
 
             self._pending_expert_routing_stats = None
             if self._should_capture_expert_routing_stats(scheduler_output):
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                routing_data = torch.empty_like(
-                    buf[:total], device="cpu", pin_memory=PIN_MEMORY
-                )
-                routing_data.copy_(buf[:total], non_blocking=True)
-                self._pending_expert_routing_stats = ExpertRoutingStatsTensors(
-                    routing_data=routing_data,
+                stats = self.routed_experts_capturer.get_stats_tensors(
                     num_reqs=len(scheduler_output.num_scheduled_tokens),
+                    num_scheduled_tokens=(scheduler_output.total_num_scheduled_tokens),
+                    num_physical_tokens=num_physical_tokens,
+                )
+                self._pending_expert_routing_stats = stats.to_cpu_nonblocking(
+                    pin_memory=PIN_MEMORY
                 )
 
             # Get the valid generated tokens.
@@ -4158,10 +4158,9 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if (
-            self.model_config.enable_return_routed_experts
-            or self._should_capture_expert_routing_stats(scheduler_output)
-        ):
+        if self._should_capture_expert_routing_stats(scheduler_output):
+            self.routed_experts_capturer.clear_stats_buffers()
+        elif self.model_config.enable_return_routed_experts:
             self.routed_experts_capturer.clear_buffer()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
@@ -4510,6 +4509,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            num_tokens_padded,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4561,6 +4561,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            num_physical_tokens,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4714,6 +4715,7 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+                num_physical_tokens,
             )
 
         if draft_after_bookkeeping:
@@ -4778,8 +4780,7 @@ class GPUModelRunner(
             if self._pending_expert_routing_stats is not None:
                 assert self.expert_routing_stats_recorder is not None
                 self.expert_routing_stats_recorder.submit(
-                    num_reqs=self._pending_expert_routing_stats.num_reqs,
-                    routing_data=self._pending_expert_routing_stats.routing_data,
+                    stats=self._pending_expert_routing_stats,
                 )
                 self._pending_expert_routing_stats = None
             return output
@@ -4812,11 +4813,14 @@ class GPUModelRunner(
 
             expert_routing_stats_snapshot = None
             if self._should_capture_expert_routing_stats(scheduler_output):
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                expert_routing_stats_snapshot = ExpertRoutingStatsTensors(
-                    routing_data=buf[:total].clone(),
-                    num_reqs=len(scheduler_output.num_scheduled_tokens),
+                expert_routing_stats_snapshot = (
+                    self.routed_experts_capturer.get_stats_tensors(
+                        num_reqs=len(scheduler_output.num_scheduled_tokens),
+                        num_scheduled_tokens=(
+                            scheduler_output.total_num_scheduled_tokens
+                        ),
+                        num_physical_tokens=num_physical_tokens,
+                    ).clone()
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -7809,6 +7813,7 @@ class GPUModelRunner(
                 torch._dynamo.mark_static_address(tensor)
 
             _mark_static(capturer.device_buffer)
+        flashinfer_buffer_marked = False
         for module in self.model.modules():
             if not isinstance(module, MoERunner):
                 continue
@@ -7820,16 +7825,59 @@ class GPUModelRunner(
                     )
                 continue
             layer_id = module.layer_id
+            routed_experts = module.routed_experts
+            capture_backend = ExpertRoutingCaptureBackend.VLLM_ROUTER
 
             if capture_stats:
                 if module.is_monolithic:
-                    raise ValueError(
-                        "VLLM_EXPERT_ROUTING_STATS does not support monolithic "
-                        f"MoE kernels (layer {layer_id})"
+                    from vllm.model_executor.layers.fused_moe.experts import (
+                        trtllm_bf16_moe,
                     )
-                module.router.set_capture_buffer(capturer.device_buffer, layer_id)
-                assert module.router._routing_replay_out is not None
-                _mark_static(module.router._routing_replay_out)
+
+                    if routed_experts.moe_config.is_sequence_parallel:
+                        raise ValueError(
+                            "VLLM_EXPERT_ROUTING_STATS does not support sequence "
+                            "parallel FlashInfer TRT-LLM capture"
+                        )
+                    moe_kernel = routed_experts.quant_method.moe_kernel
+                    fused_experts = (
+                        moe_kernel.fused_experts if moe_kernel is not None else None
+                    )
+                    if not isinstance(
+                        fused_experts,
+                        trtllm_bf16_moe.TrtLlmBf16ExpertsMonolithic,
+                    ):
+                        backend = (
+                            type(fused_experts).__name__
+                            if fused_experts is not None
+                            else "uninitialized"
+                        )
+                        raise ValueError(
+                            "VLLM_EXPERT_ROUTING_STATS supports monolithic capture "
+                            "only for FlashInfer TRT-LLM BF16; layer "
+                            f"{layer_id} uses {backend}"
+                        )
+                    if routed_experts.global_num_experts > 1 << 15:
+                        raise ValueError(
+                            "FlashInfer TRT-LLM routing capture uses signed int16 "
+                            "expert IDs and supports at most 32768 experts"
+                        )
+                    layer_buffer = capturer.bind_flashinfer_stats_buffer(layer_id)
+                    fused_experts.set_routing_replay_out(layer_buffer)
+                    if not flashinfer_buffer_marked:
+                        assert capturer.flashinfer_device_buffer is not None
+                        _mark_static(capturer.flashinfer_device_buffer)
+                        flashinfer_buffer_marked = True
+                    _mark_static(layer_buffer)
+                    capture_backend = ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM
+                else:
+                    layer_buffer = capturer.bind_modular_stats_buffer(layer_id)
+                    module.router.set_capture_buffer(capturer.device_buffer, layer_id)
+                    assert module.router._routing_replay_out is not None
+                    assert module.router._routing_replay_out.data_ptr() == (
+                        layer_buffer.data_ptr()
+                    )
+                    _mark_static(module.router._routing_replay_out)
             else:
 
                 def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
@@ -7837,13 +7885,13 @@ class GPUModelRunner(
 
                 module.router.set_capture_fn(_capture_fn)
 
-            routed_experts = module.routed_experts
             expert_map_manager = routed_experts.expert_map_manager
             placement = ExpertLayerPlacement(
                 layer_id=layer_id,
                 global_num_experts=routed_experts.global_num_experts,
                 local_expert_ids=tuple(expert_map_manager.get_local_expert_ids()),
                 placement_strategy=expert_map_manager.placement_strategy,
+                capture_backend=capture_backend,
             )
             previous = placements.setdefault(layer_id, placement)
             if previous != placement:

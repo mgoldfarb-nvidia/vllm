@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
+import struct
 import threading
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -24,7 +27,16 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
 
-_EXPERT_ROUTING_STATS_SCHEMA_VERSION = 1
+_EXPERT_ROUTING_STATS_SCHEMA_VERSION = 2
+_ROUTING_SENTINEL = -1
+_ROUTING_HASH_DOMAIN = b"vllm.expert-routing.v2\0"
+
+
+class ExpertRoutingCaptureBackend(str, Enum):
+    """Source of the exact top-k expert IDs for a layer."""
+
+    VLLM_ROUTER = "vllm_router"
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,9 @@ class ExpertLayerPlacement:
     global_num_experts: int
     local_expert_ids: tuple[int, ...]
     placement_strategy: str
+    capture_backend: ExpertRoutingCaptureBackend = (
+        ExpertRoutingCaptureBackend.VLLM_ROUTER
+    )
 
 
 @dataclass(frozen=True)
@@ -42,26 +57,176 @@ class ExpertRoutingStep:
     """One pure-decode routing snapshot waiting for CPU aggregation."""
 
     decode_step: int
-    num_reqs: int
-    routing_data: torch.Tensor
+    stats: ExpertRoutingStatsTensors
     ready_event: torch.cuda.Event | None = None
-    # Retain the CUDA allocation until its asynchronous D2H copy completes.
-    source_tensor: torch.Tensor | None = None
+    # Retain CUDA allocations until their asynchronous D2H copies complete.
+    source_tensors: tuple[torch.Tensor, ...] = ()
 
 
-class ExpertRoutingStatsTensors(NamedTuple):
-    """A device snapshot and the scheduler metadata needed to summarize it."""
+@dataclass(frozen=True)
+class ExpertRoutingStatsTensors:
+    """Routing snapshots and scheduler metadata for one decode step."""
 
-    routing_data: torch.Tensor
+    modular_routing_data: torch.Tensor | None
+    flashinfer_routing_data: torch.Tensor | None
     num_reqs: int
+    num_scheduled_tokens: int
+    num_physical_tokens: int
 
-    def to_cpu_nonblocking(self) -> ExpertRoutingStatsTensors:
-        if self.routing_data.device.type == "cpu":
-            return self
-        return ExpertRoutingStatsTensors(
-            routing_data=self.routing_data.to("cpu", non_blocking=True),
-            num_reqs=self.num_reqs,
+    def __post_init__(self) -> None:
+        if self.modular_routing_data is None and self.flashinfer_routing_data is None:
+            raise ValueError("Expert routing statistics require a capture buffer")
+        if not 0 <= self.num_scheduled_tokens <= self.num_physical_tokens:
+            raise ValueError(
+                "Expert routing token counts must satisfy "
+                "0 <= num_scheduled_tokens <= num_physical_tokens"
+            )
+
+    @property
+    def source_tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor
+            for tensor in (
+                self.modular_routing_data,
+                self.flashinfer_routing_data,
+            )
+            if tensor is not None
         )
+
+    def clone(self) -> ExpertRoutingStatsTensors:
+        return ExpertRoutingStatsTensors(
+            modular_routing_data=(
+                self.modular_routing_data.clone()
+                if self.modular_routing_data is not None
+                else None
+            ),
+            flashinfer_routing_data=(
+                self.flashinfer_routing_data.clone()
+                if self.flashinfer_routing_data is not None
+                else None
+            ),
+            num_reqs=self.num_reqs,
+            num_scheduled_tokens=self.num_scheduled_tokens,
+            num_physical_tokens=self.num_physical_tokens,
+        )
+
+    def to_cpu_nonblocking(
+        self, *, pin_memory: bool = False
+    ) -> ExpertRoutingStatsTensors:
+        def _copy(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None or tensor.device.type == "cpu":
+                return tensor
+            if not pin_memory:
+                return tensor.to("cpu", non_blocking=True)
+            output = torch.empty_like(
+                tensor,
+                device="cpu",
+                pin_memory=True,
+                memory_format=torch.contiguous_format,
+            )
+            output.copy_(tensor, non_blocking=True)
+            return output
+
+        return ExpertRoutingStatsTensors(
+            modular_routing_data=_copy(self.modular_routing_data),
+            flashinfer_routing_data=_copy(self.flashinfer_routing_data),
+            num_reqs=self.num_reqs,
+            num_scheduled_tokens=self.num_scheduled_tokens,
+            num_physical_tokens=self.num_physical_tokens,
+        )
+
+
+def _routing_data_for_layer(
+    stats: ExpertRoutingStatsTensors,
+    placement: ExpertLayerPlacement,
+) -> np.ndarray:
+    if placement.capture_backend == ExpertRoutingCaptureBackend.VLLM_ROUTER:
+        if stats.modular_routing_data is None:
+            raise ValueError(
+                f"MoE layer {placement.layer_id} has no vLLM router capture"
+            )
+        return stats.modular_routing_data.numpy()[:, placement.layer_id, :]
+    if placement.capture_backend == ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM:
+        if stats.flashinfer_routing_data is None:
+            raise ValueError(
+                f"MoE layer {placement.layer_id} has no FlashInfer capture"
+            )
+        return stats.flashinfer_routing_data.numpy()[placement.layer_id, :, :]
+    raise ValueError(
+        f"MoE layer {placement.layer_id} uses unknown capture backend "
+        f"{placement.capture_backend!r}"
+    )
+
+
+def _validate_routing_data(
+    routing_data: np.ndarray,
+    placement: ExpertLayerPlacement,
+    num_physical_tokens: int,
+) -> None:
+    if routing_data.ndim != 2 or routing_data.shape[0] != num_physical_tokens:
+        raise ValueError(
+            f"MoE layer {placement.layer_id} routing shape {routing_data.shape} does "
+            f"not match physical token count {num_physical_tokens}"
+        )
+    invalid = (routing_data < 0) | (routing_data >= placement.global_num_experts)
+    if invalid.any():
+        first_row, first_col = np.argwhere(invalid)[0]
+        raise ValueError(
+            f"MoE layer {placement.layer_id} has invalid expert ID "
+            f"{routing_data[first_row, first_col]} at physical token {first_row}, "
+            f"top-k slot {first_col}"
+        )
+    if routing_data.shape[1] > 1:
+        sorted_ids = np.sort(routing_data, axis=1)
+        duplicate_rows = np.flatnonzero((np.diff(sorted_ids, axis=1) == 0).any(axis=1))
+        if duplicate_rows.size:
+            raise ValueError(
+                f"MoE layer {placement.layer_id} has duplicate expert IDs at "
+                f"physical token {duplicate_rows[0]}"
+            )
+
+
+def _local_expert_counts(
+    routing_data: np.ndarray,
+    placement: ExpertLayerPlacement,
+) -> np.ndarray:
+    global_counts = np.bincount(
+        routing_data.reshape(-1).astype(np.int64),
+        minlength=placement.global_num_experts,
+    )
+    return global_counts[np.asarray(placement.local_expert_ids, dtype=np.int64)]
+
+
+def _routing_sha256(
+    routing_data: np.ndarray,
+    *,
+    scope: str,
+    layer_id: int,
+    num_scheduled_tokens: int,
+    num_physical_tokens: int,
+) -> str:
+    """Hash a canonical expert-ID matrix for cross-rank comparison.
+
+    The input is normalized to row-major little-endian int32. The hash binds the
+    domain, scope, layer, useful and physical token counts, and matrix shape.
+    """
+    normalized = np.ascontiguousarray(routing_data, dtype="<i4")
+    rows, top_k = normalized.shape
+    header = struct.pack(
+        "<5q",
+        layer_id,
+        num_scheduled_tokens,
+        num_physical_tokens,
+        rows,
+        top_k,
+    )
+    digest = hashlib.sha256()
+    digest.update(_ROUTING_HASH_DOMAIN)
+    digest.update(scope.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(header)
+    digest.update(normalized.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def summarize_expert_routing(
@@ -71,29 +236,57 @@ def summarize_expert_routing(
     """Summarize exact local expert occupancy for one decode step."""
     if step.ready_event is not None:
         step.ready_event.synchronize()
-    routing_data = step.routing_data.numpy()
+    stats = step.stats
     layers = []
+    top_k = None
     for placement in layer_placements:
-        expert_ids = routing_data[:, placement.layer_id, :].reshape(-1)
-        valid_ids = expert_ids[
-            (expert_ids >= 0) & (expert_ids < placement.global_num_experts)
-        ]
-        global_counts = np.bincount(
-            valid_ids.astype(np.int64), minlength=placement.global_num_experts
+        routing_data = _routing_data_for_layer(stats, placement)
+        _validate_routing_data(routing_data, placement, stats.num_physical_tokens)
+        if top_k is None:
+            top_k = routing_data.shape[1]
+        elif top_k != routing_data.shape[1]:
+            raise ValueError("MoE layers have inconsistent top-k dimensions")
+        useful_counts = _local_expert_counts(
+            routing_data[: stats.num_scheduled_tokens], placement
         )
-        local_counts = global_counts[np.asarray(placement.local_expert_ids)]
+        physical_counts = _local_expert_counts(routing_data, placement)
+        padding_counts = physical_counts - useful_counts
         layers.append(
             {
                 "layer_id": placement.layer_id,
-                "local_tokens_per_expert": local_counts.tolist(),
+                "capture_backend": placement.capture_backend.value,
+                "useful_route_sha256": _routing_sha256(
+                    routing_data[: stats.num_scheduled_tokens],
+                    scope="useful",
+                    layer_id=placement.layer_id,
+                    num_scheduled_tokens=stats.num_scheduled_tokens,
+                    num_physical_tokens=stats.num_physical_tokens,
+                ),
+                "physical_route_sha256": _routing_sha256(
+                    routing_data,
+                    scope="physical",
+                    layer_id=placement.layer_id,
+                    num_scheduled_tokens=stats.num_scheduled_tokens,
+                    num_physical_tokens=stats.num_physical_tokens,
+                ),
+                "useful_local_assignments_per_expert": useful_counts.tolist(),
+                "physical_local_assignments_per_expert": physical_counts.tolist(),
+                "padding_local_assignments_per_expert": padding_counts.tolist(),
             }
         )
 
+    assert top_k is not None
+    num_padding_tokens = stats.num_physical_tokens - stats.num_scheduled_tokens
     return {
         "record_type": "decode_step",
         "decode_step": step.decode_step,
-        "num_reqs": step.num_reqs,
-        "num_scheduled_tokens": routing_data.shape[0],
+        "num_reqs": stats.num_reqs,
+        "num_scheduled_tokens": stats.num_scheduled_tokens,
+        "num_physical_tokens": stats.num_physical_tokens,
+        "num_padding_tokens": num_padding_tokens,
+        "useful_assignments": stats.num_scheduled_tokens * top_k,
+        "physical_assignments": stats.num_physical_tokens * top_k,
+        "padding_assignments": num_padding_tokens * top_k,
         "layers": layers,
     }
 
@@ -110,8 +303,30 @@ class ExpertRoutingStatsRecorder:
     ) -> None:
         if not layer_placements:
             raise ValueError("Expert routing statistics require at least one MoE layer")
+        if top_k <= 0:
+            raise ValueError(
+                f"Expert routing statistics require positive top_k, got {top_k}"
+            )
+        for placement in layer_placements:
+            local_expert_ids = np.asarray(placement.local_expert_ids, dtype=np.int64)
+            if (
+                placement.global_num_experts <= 0
+                or (local_expert_ids < 0).any()
+                or (local_expert_ids >= placement.global_num_experts).any()
+                or np.unique(local_expert_ids).size != local_expert_ids.size
+            ):
+                raise ValueError(
+                    f"MoE layer {placement.layer_id} has invalid local expert placement"
+                )
+        capture_backends = {placement.capture_backend for placement in layer_placements}
+        if len(capture_backends) != 1:
+            raise ValueError(
+                "Expert routing statistics require one capture backend across all "
+                "MoE layers"
+            )
         self._global_rank = global_rank
         self._layer_placements = layer_placements
+        self._capture_backend = capture_backends.pop()
         self._top_k = top_k
         self._queue: queue.SimpleQueue[ExpertRoutingStep | str] | None = None
         self._thread: threading.Thread | None = None
@@ -139,6 +354,7 @@ class ExpertRoutingStatsRecorder:
             "iteration": iteration,
             "global_rank": self._global_rank,
             "top_k": self._top_k,
+            "capture_backend": self._capture_backend.value,
             "layers": [asdict(layer) for layer in self._layer_placements],
         }
         with path.open("x", encoding="utf-8") as output:
@@ -157,21 +373,19 @@ class ExpertRoutingStatsRecorder:
 
     def submit(
         self,
-        num_reqs: int,
-        routing_data: torch.Tensor,
+        stats: ExpertRoutingStatsTensors,
         *,
         ready_event: torch.cuda.Event | None = None,
-        source_tensor: torch.Tensor | None = None,
+        source_tensors: tuple[torch.Tensor, ...] = (),
     ) -> None:
         if self._queue is None:
             return
         self._raise_writer_error()
         step = ExpertRoutingStep(
             decode_step=self._decode_steps,
-            num_reqs=num_reqs,
-            routing_data=routing_data,
+            stats=stats,
             ready_event=ready_event,
-            source_tensor=source_tensor,
+            source_tensors=source_tensors,
         )
         self._decode_steps += 1
         self._queue.put(step)
@@ -296,9 +510,11 @@ class RoutedExpertsCapturer:
     Invariants:
         - One instance per worker; shape is fixed at init and covers the
           worst-case step (``max_num_batched_tokens`` tokens).
-        - :meth:`clear_buffer` is called at the start of every step, so
-          unused slots stay zero.
+        - :meth:`clear_buffer` preserves zero-fill semantics for routed-expert
+          return; statistics use :meth:`clear_stats_buffers` and ``-1`` sentinels.
         - ``device_buffer.dtype`` is ``torch.int32``.
+        - FlashInfer TRT-LLM capture uses a separate layer-major ``int16``
+          buffer so each per-layer view is contiguous as required by its API.
     """
 
     def __init__(
@@ -322,8 +538,89 @@ class RoutedExpertsCapturer:
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        self.flashinfer_device_buffer: torch.Tensor | None = None
+        self._stats_capture_backends: dict[int, ExpertRoutingCaptureBackend] = {}
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    def bind_modular_stats_buffer(self, layer_id: int) -> torch.Tensor:
+        """Bind one modular layer to its compiler-visible capture view."""
+        self._register_stats_backend(layer_id, ExpertRoutingCaptureBackend.VLLM_ROUTER)
+        return self.device_buffer[:, layer_id, :]
+
+    def bind_flashinfer_stats_buffer(self, layer_id: int) -> torch.Tensor:
+        """Bind one monolithic layer to a contiguous FlashInfer replay view."""
+        self._register_stats_backend(
+            layer_id, ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM
+        )
+        if self.flashinfer_device_buffer is None:
+            max_tokens, num_layers, top_k = self.device_buffer.shape
+            self.flashinfer_device_buffer = torch.full(
+                (num_layers, max_tokens, top_k),
+                _ROUTING_SENTINEL,
+                dtype=torch.int16,
+                device=self.device_buffer.device,
+            )
+        layer_buffer = self.flashinfer_device_buffer[layer_id]
+        assert layer_buffer.is_contiguous()
+        return layer_buffer
+
+    def _register_stats_backend(
+        self,
+        layer_id: int,
+        backend: ExpertRoutingCaptureBackend,
+    ) -> None:
+        if not 0 <= layer_id < self.device_buffer.shape[1]:
+            raise ValueError(
+                f"MoE layer {layer_id} exceeds routing capture capacity "
+                f"{self.device_buffer.shape[1]}"
+            )
+        previous = self._stats_capture_backends.setdefault(layer_id, backend)
+        if previous != backend:
+            raise ValueError(
+                f"MoE layer {layer_id} cannot use both {previous.value} and "
+                f"{backend.value} routing capture"
+            )
+
+    def clear_stats_buffers(self) -> None:
+        """Fill active statistics buffers with an invalid-ID sentinel."""
+        active_backends = set(self._stats_capture_backends.values())
+        if ExpertRoutingCaptureBackend.VLLM_ROUTER in active_backends:
+            self.device_buffer.fill_(_ROUTING_SENTINEL)
+        if self.flashinfer_device_buffer is not None:
+            self.flashinfer_device_buffer.fill_(_ROUTING_SENTINEL)
+
+    def get_stats_tensors(
+        self,
+        *,
+        num_reqs: int,
+        num_scheduled_tokens: int,
+        num_physical_tokens: int,
+    ) -> ExpertRoutingStatsTensors:
+        """Return B-row views for all active routing capture backends."""
+        if num_physical_tokens > self.device_buffer.shape[0]:
+            raise ValueError(
+                f"Physical token count {num_physical_tokens} exceeds routing "
+                f"capture capacity {self.device_buffer.shape[0]}"
+            )
+        active_backends = set(self._stats_capture_backends.values())
+        modular_data = (
+            self.device_buffer[:num_physical_tokens]
+            if ExpertRoutingCaptureBackend.VLLM_ROUTER in active_backends
+            else None
+        )
+        flashinfer_data = (
+            self.flashinfer_device_buffer[:, :num_physical_tokens, :]
+            if self.flashinfer_device_buffer is not None
+            else None
+        )
+        return ExpertRoutingStatsTensors(
+            modular_routing_data=modular_data,
+            flashinfer_routing_data=flashinfer_data,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_physical_tokens=num_physical_tokens,
+        )
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Capture expert routing decisions for a specific layer.

@@ -201,6 +201,29 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
     BF16 unquantized TRTLLM-Gen MoE kernels. Supports monolithic interface.
     """
 
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ) -> None:
+        super().__init__(moe_config, quant_config)
+        self._routing_replay_out: torch.Tensor | None = None
+
+    def set_routing_replay_out(self, buffer: torch.Tensor) -> None:
+        """Capture exact in-kernel expert selections into a static buffer."""
+        if buffer.dtype != torch.int16:
+            raise ValueError(
+                f"FlashInfer routing replay requires int16, got {buffer.dtype}"
+            )
+        if buffer.ndim != 2 or buffer.shape[1] != self.topk:
+            raise ValueError(
+                "FlashInfer routing replay requires shape "
+                f"[num_tokens_or_larger, {self.topk}], got {tuple(buffer.shape)}"
+            )
+        if not buffer.is_contiguous():
+            raise ValueError("FlashInfer routing replay buffer must be contiguous")
+        self._routing_replay_out = buffer
+
     @staticmethod
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
@@ -263,4 +286,5 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             routing_method_type=self.routing_method_type,
             activation_type=activation_to_flashinfer_int(activation),
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+            routing_replay_out=self._routing_replay_out,
         )

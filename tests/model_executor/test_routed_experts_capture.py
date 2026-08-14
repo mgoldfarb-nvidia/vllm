@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import sys
 import types
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -14,7 +15,9 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     ExpertLayerPlacement,
+    ExpertRoutingCaptureBackend,
     ExpertRoutingStatsRecorder,
+    ExpertRoutingStatsTensors,
     ExpertRoutingStep,
     RoutedExpertsCapturer,
     summarize_expert_routing,
@@ -45,6 +48,8 @@ def _capturer_with_buffer(
         -1,
         dtype=torch.int32,
     )
+    c.flashinfer_device_buffer = None
+    c._stats_capture_backends = {}
     return c
 
 
@@ -84,18 +89,61 @@ def _make_modular_routed_experts():
     )
 
 
-def test_summarize_expert_routing_uses_actual_local_placement():
-    routing_data = torch.tensor(
+def _make_monolithic_routed_experts():
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+        TrtLlmBf16ExpertsMonolithic,
+    )
+
+    fused_experts = TrtLlmBf16ExpertsMonolithic.__new__(TrtLlmBf16ExpertsMonolithic)
+    fused_experts.topk = 2
+    fused_experts._routing_replay_out = None
+    return types.SimpleNamespace(
+        global_num_experts=16,
+        moe_config=types.SimpleNamespace(is_sequence_parallel=False),
+        quant_method=types.SimpleNamespace(
+            is_monolithic=True,
+            moe_kernel=types.SimpleNamespace(fused_experts=fused_experts),
+        ),
+        expert_map_manager=types.SimpleNamespace(
+            get_local_expert_ids=lambda: list(range(16)),
+            placement_strategy="linear",
+        ),
+    )
+
+
+def test_summarize_expert_routing_separates_useful_and_physical_assignments():
+    modular_routing_data = torch.tensor(
         [
-            [[0, 1], [3, 3]],
-            [[2, 2], [1, 0]],
+            [[0, 1], [-1, -1]],
+            [[2, 3], [-1, -1]],
+            [[2, 1], [-1, -1]],
         ],
         dtype=torch.int32,
     )
-    step = ExpertRoutingStep(decode_step=7, num_reqs=2, routing_data=routing_data)
+    flashinfer_routing_data = torch.tensor(
+        [
+            [[-1, -1], [-1, -1], [-1, -1]],
+            [[3, 2], [1, 0], [3, 2]],
+        ],
+        dtype=torch.int16,
+    )
+    stats = ExpertRoutingStatsTensors(
+        modular_routing_data=modular_routing_data,
+        flashinfer_routing_data=flashinfer_routing_data,
+        num_reqs=2,
+        num_scheduled_tokens=2,
+        num_physical_tokens=3,
+    )
+    step = ExpertRoutingStep(decode_step=7, stats=stats)
     placements = (
         ExpertLayerPlacement(0, 4, (0, 2), "round_robin"),
-        ExpertLayerPlacement(1, 4, (1, 3), "round_robin"),
+        ExpertLayerPlacement(
+            1,
+            4,
+            (1, 3),
+            "round_robin",
+            ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM,
+        ),
     )
 
     summary = summarize_expert_routing(step, placements)
@@ -105,11 +153,64 @@ def test_summarize_expert_routing_uses_actual_local_placement():
         "decode_step": 7,
         "num_reqs": 2,
         "num_scheduled_tokens": 2,
+        "num_physical_tokens": 3,
+        "num_padding_tokens": 1,
+        "useful_assignments": 4,
+        "physical_assignments": 6,
+        "padding_assignments": 2,
         "layers": [
-            {"layer_id": 0, "local_tokens_per_expert": [1, 2]},
-            {"layer_id": 1, "local_tokens_per_expert": [1, 2]},
+            {
+                "layer_id": 0,
+                "capture_backend": "vllm_router",
+                "useful_route_sha256": (
+                    "a1b3f5c4a2c43bb0546498837867ecbe02dce16caa8e7b7c0ccd3850f7f73df0"
+                ),
+                "physical_route_sha256": (
+                    "03815bae958156ebf478b19fa21d8715629510990286d68ede0805a04ceafbd5"
+                ),
+                "useful_local_assignments_per_expert": [1, 1],
+                "physical_local_assignments_per_expert": [1, 2],
+                "padding_local_assignments_per_expert": [0, 1],
+            },
+            {
+                "layer_id": 1,
+                "capture_backend": "flashinfer_trtllm",
+                "useful_route_sha256": (
+                    "4739aba795ad92973ca4152371f6d721bd37a1b2c3f9c08c8e77bafee6111516"
+                ),
+                "physical_route_sha256": (
+                    "725a3a7d64f1a9c722a09a45e533ca2b4de22ab0b3cb62599212f7791237af6f"
+                ),
+                "useful_local_assignments_per_expert": [1, 1],
+                "physical_local_assignments_per_expert": [1, 2],
+                "padding_local_assignments_per_expert": [0, 1],
+            },
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("routing_data", "match"),
+    (
+        (torch.tensor([[0, -1], [1, 2]], dtype=torch.int32), "invalid expert ID"),
+        (torch.tensor([[0, 0], [1, 2]], dtype=torch.int32), "duplicate expert IDs"),
+        (torch.tensor([[0, 4], [1, 2]], dtype=torch.int32), "invalid expert ID"),
+    ),
+)
+def test_summarize_expert_routing_fails_closed(routing_data, match):
+    stats = ExpertRoutingStatsTensors(
+        modular_routing_data=routing_data[:, None, :],
+        flashinfer_routing_data=None,
+        num_reqs=1,
+        num_scheduled_tokens=1,
+        num_physical_tokens=2,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        summarize_expert_routing(
+            ExpertRoutingStep(decode_step=0, stats=stats),
+            (ExpertLayerPlacement(0, 4, (0, 1), "linear"),),
+        )
 
 
 def test_expert_routing_stats_recorder_writes_complete_window(tmp_path):
@@ -121,8 +222,13 @@ def test_expert_routing_stats_recorder_writes_complete_window(tmp_path):
 
     path = recorder.begin(str(tmp_path), iteration=5)
     recorder.submit(
-        num_reqs=2,
-        routing_data=torch.tensor([[[0, 1]], [[1, 3]]], dtype=torch.int32),
+        stats=ExpertRoutingStatsTensors(
+            modular_routing_data=torch.tensor([[[0, 1]], [[1, 3]]], dtype=torch.int32),
+            flashinfer_routing_data=None,
+            num_reqs=2,
+            num_scheduled_tokens=2,
+            num_physical_tokens=2,
+        ),
     )
     result = recorder.finish()
 
@@ -135,12 +241,70 @@ def test_expert_routing_stats_recorder_writes_complete_window(tmp_path):
         "summary",
     ]
     assert records[0]["global_rank"] == 3
-    assert records[1]["layers"][0]["local_tokens_per_expert"] == [1, 2]
+    assert records[0]["schema_version"] == 2
+    assert records[0]["capture_backend"] == "vllm_router"
+    assert records[0]["layers"][0]["capture_backend"] == "vllm_router"
+    assert records[1]["layers"][0]["physical_local_assignments_per_expert"] == [1, 2]
     assert records[2] == {
         "record_type": "summary",
         "status": "complete",
         "decode_steps": 1,
     }
+
+
+def test_expert_routing_stats_recorder_rejects_mixed_capture_backends():
+    placements = (
+        ExpertLayerPlacement(0, 4, (0, 1), "linear"),
+        ExpertLayerPlacement(
+            1,
+            4,
+            (0, 1),
+            "linear",
+            ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="one capture backend"):
+        ExpertRoutingStatsRecorder(
+            global_rank=0,
+            layer_placements=placements,
+            top_k=2,
+        )
+
+
+def test_route_hashes_detect_divergence_hidden_by_local_histograms():
+    placement = ExpertLayerPlacement(0, 4, (0, 1), "linear")
+
+    def summarize(routing_data):
+        stats = ExpertRoutingStatsTensors(
+            modular_routing_data=routing_data[:, None, :],
+            flashinfer_routing_data=None,
+            num_reqs=2,
+            num_scheduled_tokens=2,
+            num_physical_tokens=2,
+        )
+        return summarize_expert_routing(
+            ExpertRoutingStep(decode_step=0, stats=stats),
+            (placement,),
+        )["layers"][0]
+
+    first = summarize(torch.tensor([[0, 2], [1, 3]], dtype=torch.int16))
+    second = summarize(torch.tensor([[0, 3], [1, 2]], dtype=torch.int64))
+
+    assert first["physical_local_assignments_per_expert"] == [1, 1]
+    assert second["physical_local_assignments_per_expert"] == [1, 1]
+    assert first["useful_route_sha256"] == (
+        "fe75a7d0fef37822777df982bd8ef5e299d29e1c0c4a996c51b29be014d968e7"
+    )
+    assert first["physical_route_sha256"] == (
+        "017a0f41174bbf1a3c8b085bfb87d2f1ab3aa4cf6b17e388baa230ba2c1e88b8"
+    )
+    assert second["useful_route_sha256"] == (
+        "f5c2fd25de4c481464ac7017c4a7c76df579fc223530ef71cbb1658cbacd3357"
+    )
+    assert second["physical_route_sha256"] == (
+        "7fe332f94aa80e1a5201073d6b5aabc8c973a49c70b973f7e7da4ca0494dea6f"
+    )
 
 
 def test_expert_routing_stats_recorder_waits_for_async_copy(tmp_path):
@@ -149,21 +313,28 @@ def test_expert_routing_stats_recorder_waits_for_async_copy(tmp_path):
         layer_placements=(ExpertLayerPlacement(0, 4, (0, 1), "linear"),),
         top_k=2,
     )
-    routing_data = torch.zeros((1, 1, 2), dtype=torch.int32)
-    ready_event = SimpleNamespace(synchronize=lambda: routing_data.fill_(1))
+    routing_data = torch.full((1, 1, 2), -1, dtype=torch.int32)
+    ready_event = SimpleNamespace(
+        synchronize=lambda: routing_data.copy_(torch.tensor([[[1, 2]]]))
+    )
 
     path = recorder.begin(str(tmp_path), iteration=2)
     recorder.submit(
-        num_reqs=1,
-        routing_data=routing_data,
+        stats=ExpertRoutingStatsTensors(
+            modular_routing_data=routing_data,
+            flashinfer_routing_data=None,
+            num_reqs=1,
+            num_scheduled_tokens=1,
+            num_physical_tokens=1,
+        ),
         ready_event=ready_event,
-        source_tensor=torch.empty(0),
+        source_tensors=(torch.empty(0),),
     )
     recorder.finish()
 
     with open(path, encoding="utf-8") as stats_file:
         records = [json.loads(line) for line in stats_file]
-    assert records[1]["layers"][0]["local_tokens_per_expert"] == [0, 2]
+    assert records[1]["layers"][0]["physical_local_assignments_per_expert"] == [0, 1]
 
 
 def test_base_router_capture_pre_eplb_mapping():
@@ -244,6 +415,97 @@ def test_base_router_capture_with_eplb_enabled():
     assert torch.equal(topk_ids, torch.tensor([[11, 12], [13, 14]]))
 
 
+def test_flashinfer_stats_buffer_is_layer_major_int16_and_sentinel_filled():
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=4)
+
+    layer_buffer = capturer.bind_flashinfer_stats_buffer(layer_id=2)
+
+    assert capturer.flashinfer_device_buffer.shape == (4, 8, 2)
+    assert layer_buffer.shape == (8, 2)
+    assert layer_buffer.dtype == torch.int16
+    assert layer_buffer.is_contiguous()
+    assert torch.all(layer_buffer == -1)
+
+    layer_buffer[0] = torch.tensor([1, 2], dtype=torch.int16)
+    capturer.clear_stats_buffers()
+    assert torch.all(layer_buffer == -1)
+
+
+def test_stats_snapshot_preserves_m_and_slices_b_for_both_backends():
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=4)
+    capturer.bind_modular_stats_buffer(layer_id=0)
+    capturer.bind_flashinfer_stats_buffer(layer_id=2)
+
+    stats = capturer.get_stats_tensors(
+        num_reqs=3,
+        num_scheduled_tokens=3,
+        num_physical_tokens=4,
+    )
+
+    assert stats.num_scheduled_tokens == 3
+    assert stats.num_physical_tokens == 4
+    assert stats.modular_routing_data is not None
+    assert stats.flashinfer_routing_data is not None
+    assert stats.modular_routing_data.shape == (4, 4, 2)
+    assert stats.flashinfer_routing_data.shape == (4, 4, 2)
+
+
+def test_trtllm_monolithic_forwards_exact_routing_replay_buffer(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts import trtllm_bf16_moe
+
+    calls = []
+    fake_flashinfer = SimpleNamespace(
+        fused_moe=SimpleNamespace(
+            trtllm_bf16_moe=lambda **kwargs: calls.append(kwargs) or torch.empty(0)
+        )
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setattr(trtllm_bf16_moe, "fi_moe_largest_bucket", lambda _: 256)
+    monkeypatch.setattr(trtllm_bf16_moe, "activation_to_flashinfer_int", lambda _: 3)
+
+    experts = trtllm_bf16_moe.TrtLlmBf16ExpertsMonolithic.__new__(
+        trtllm_bf16_moe.TrtLlmBf16ExpertsMonolithic
+    )
+    experts.topk = 2
+    experts.intermediate_size_per_partition = 16
+    experts.ep_rank = 0
+    experts.local_num_experts = 4
+    experts.routing_method_type = RoutingMethodType.Default
+    experts.moe_config = object()
+    experts._routing_replay_out = None
+    replay_buffer = torch.full((8, 2), -1, dtype=torch.int16)
+    experts.set_routing_replay_out(replay_buffer)
+
+    experts.apply(
+        hidden_states=torch.empty((3, 4)),
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        router_logits=torch.empty((3, 8)),
+        activation=MoEActivation.SILU,
+        global_num_experts=8,
+        expert_map=None,
+        a1q_scale=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["routing_replay_out"] is replay_buffer
+
+
+def test_trtllm_monolithic_rejects_noncontiguous_routing_replay_buffer():
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+        TrtLlmBf16ExpertsMonolithic,
+    )
+
+    experts = TrtLlmBf16ExpertsMonolithic.__new__(TrtLlmBf16ExpertsMonolithic)
+    experts.topk = 2
+    buffer = torch.empty((2, 8), dtype=torch.int16).transpose(0, 1)
+
+    with pytest.raises(ValueError, match="must be contiguous"):
+        experts.set_routing_replay_out(buffer)
+
+
 def test_gpu_model_runner_binds_router_capture(monkeypatch):
     from vllm.v1.worker import gpu_model_runner as gmr
 
@@ -253,14 +515,6 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
             self.router = _make_router()
             self.routed_experts = _make_modular_routed_experts()
             self.is_monolithic = False
-
-    class DummyCapturer:
-        def __init__(self):
-            self.calls = []
-            self.device_buffer = torch.empty((8, 12, 2), dtype=torch.int32)
-
-        def capture(self, layer_id, topk_ids):
-            self.calls.append((layer_id, topk_ids))
 
     dummy_module = DummyFusedMoE()
 
@@ -286,7 +540,7 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
         model=types.SimpleNamespace(modules=lambda: [dummy_module]),
     )
 
-    capturer = DummyCapturer()
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=12)
     gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
 
     assert dummy_module.router.capture_fn is None
@@ -311,14 +565,6 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
             self.routed_experts = _make_modular_routed_experts()
             self.is_monolithic = False
 
-    class DummyCapturer:
-        def __init__(self):
-            self.calls = []
-            self.device_buffer = torch.empty((8, 12, 2), dtype=torch.int32)
-
-        def capture(self, layer_id, topk_ids):
-            self.calls.append((layer_id, topk_ids))
-
     dummy_module = DummyFusedMoE()
 
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
@@ -340,7 +586,7 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     # Before binding, no capture hook.
     assert dummy_module.router.capture_fn is None
 
-    capturer = DummyCapturer()
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=12)
     gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
 
     # DP1 binds the compiler-visible device buffer instead of a Python hook.
@@ -410,10 +656,7 @@ def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
         ),
     )
 
-    capturer = types.SimpleNamespace(
-        capture=lambda *_: None,
-        device_buffer=torch.empty((8, 12, 2), dtype=torch.int32),
-    )
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=12)
     gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
 
     assert target_module.router._routing_replay_out.data_ptr() == (
@@ -422,14 +665,14 @@ def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
     assert draft_module.router._routing_replay_out is None
 
 
-def test_gpu_model_runner_rejects_monolithic_stats_capture(monkeypatch):
+def test_gpu_model_runner_binds_flashinfer_monolithic_stats_capture(monkeypatch):
     from vllm.v1.worker import gpu_model_runner as gmr
 
     class DummyFusedMoE:
         def __init__(self):
             self.layer_id = 1
             self.router = _make_router()
-            self.routed_experts = _make_modular_routed_experts()
+            self.routed_experts = _make_monolithic_routed_experts()
             self.is_monolithic = True
 
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
@@ -447,11 +690,62 @@ def test_gpu_model_runner_rejects_monolithic_stats_capture(monkeypatch):
     runner = types.SimpleNamespace(
         model=types.SimpleNamespace(modules=lambda: [module]),
     )
-    capturer = types.SimpleNamespace(
-        device_buffer=torch.empty((8, 12, 2), dtype=torch.int32)
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=12)
+
+    placements = gmr.GPUModelRunner._bind_routed_experts_capturer(runner, capturer)
+
+    replay_buffer = (
+        module.routed_experts.quant_method.moe_kernel.fused_experts._routing_replay_out
+    )
+    assert replay_buffer is not None
+    assert replay_buffer.shape == (8, 2)
+    assert replay_buffer.dtype == torch.int16
+    assert replay_buffer.is_contiguous()
+    assert replay_buffer.data_ptr() == capturer.flashinfer_device_buffer[1].data_ptr()
+    assert module.router._routing_replay_out is None
+    assert placements[0].capture_backend == (
+        ExpertRoutingCaptureBackend.FLASHINFER_TRTLLM
     )
 
-    with pytest.raises(ValueError, match="monolithic MoE kernels"):
+
+def test_gpu_model_runner_rejects_other_monolithic_stats_capture(monkeypatch):
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    class DummyFusedMoE:
+        def __init__(self):
+            self.layer_id = 1
+            self.router = _make_router()
+            self.routed_experts = types.SimpleNamespace(
+                global_num_experts=16,
+                moe_config=types.SimpleNamespace(is_sequence_parallel=False),
+                quant_method=types.SimpleNamespace(
+                    moe_kernel=types.SimpleNamespace(fused_experts=object())
+                ),
+                expert_map_manager=types.SimpleNamespace(
+                    get_local_expert_ids=lambda: list(range(16)),
+                    placement_strategy="linear",
+                ),
+            )
+            self.is_monolithic = True
+
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
+    monkeypatch.setattr(gmr.envs, "VLLM_EXPERT_ROUTING_STATS", True)
+    monkeypatch.setattr(
+        torch.compiler,
+        "cudagraph_mark_tensor_static",
+        lambda tensor: None,
+        raising=False,
+    )
+    monkeypatch.setattr(torch._dynamo, "mark_static_address", lambda tensor: None)
+    module = DummyFusedMoE()
+    runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(modules=lambda: [module]),
+    )
+    capturer = _capturer_with_buffer(max_tokens=8, num_layers=12)
+
+    with pytest.raises(ValueError, match="only for FlashInfer TRT-LLM BF16"):
         gmr.GPUModelRunner._bind_routed_experts_capturer(runner, capturer)
 
 
@@ -533,17 +827,17 @@ def test_gpu_worker_binds_stats_after_weights_pool_before_first_profile(monkeypa
 
 
 @pytest.mark.parametrize(
-    ("return_routed_experts", "capture_stats", "expected_clears"),
+    ("return_routed_experts", "capture_stats", "expected_clear"),
     (
-        (True, False, 1),
-        (False, True, 1),
-        (False, False, 0),
+        (True, False, "return"),
+        (False, True, "stats"),
+        (False, False, None),
     ),
 )
 def test_gpu_model_runner_only_clears_routing_needed_by_this_step(
     return_routed_experts,
     capture_stats,
-    expected_clears,
+    expected_clear,
 ):
     from vllm.v1.worker import gpu_model_runner as gmr
 
@@ -557,13 +851,11 @@ def test_gpu_model_runner_only_clears_routing_needed_by_this_step(
         )
 
         def __init__(self):
-            self.clear_calls = 0
+            self.clear_calls = []
             self.routed_experts_capturer = types.SimpleNamespace(
-                clear_buffer=self._clear_buffer
+                clear_buffer=lambda: self.clear_calls.append("return"),
+                clear_stats_buffers=lambda: self.clear_calls.append("stats"),
             )
-
-        def _clear_buffer(self):
-            self.clear_calls += 1
 
         def _should_capture_expert_routing_stats(self, scheduler_output):
             return capture_stats
@@ -577,7 +869,7 @@ def test_gpu_model_runner_only_clears_routing_needed_by_this_step(
     with pytest.raises(StopAfterClear):
         gmr.GPUModelRunner.execute_model(runner, types.SimpleNamespace())
 
-    assert runner.clear_calls == expected_clears
+    assert runner.clear_calls == ([] if expected_clear is None else [expected_clear])
 
 
 def test_stats_d2h_does_not_require_return_routed_experts(monkeypatch):
@@ -590,9 +882,12 @@ def test_stats_d2h_does_not_require_return_routed_experts(monkeypatch):
         raise CopyComplete
 
     routing_data = torch.tensor(
-        [[[1, 2]], [[3, 4]]],
+        [[[1, 2]], [[3, 4]], [[5, 6]], [[7, 8]]],
         dtype=torch.int32,
     )
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=1)
+    capturer.bind_modular_stats_buffer(layer_id=0)
+    capturer.device_buffer.copy_(routing_data)
     runner = types.SimpleNamespace(
         input_batch=types.SimpleNamespace(
             num_reqs=2,
@@ -605,9 +900,7 @@ def test_stats_d2h_does_not_require_return_routed_experts(monkeypatch):
         ),
         use_async_scheduling=False,
         model_config=types.SimpleNamespace(enable_return_routed_experts=False),
-        routed_experts_capturer=types.SimpleNamespace(
-            get_device_buffer=lambda: routing_data,
-        ),
+        routed_experts_capturer=capturer,
         _pending_expert_routing_stats=None,
         _should_capture_expert_routing_stats=lambda _: True,
         _to_list=stop_after_copy,
@@ -630,12 +923,15 @@ def test_stats_d2h_does_not_require_return_routed_experts(monkeypatch):
             logits=None,
             hidden_states=torch.empty((2, 1)),
             num_scheduled_tokens=2,
+            num_physical_tokens=4,
         )
 
     snapshot = runner._pending_expert_routing_stats
     assert snapshot is not None
     assert snapshot.num_reqs == 2
-    assert torch.equal(snapshot.routing_data, routing_data)
+    assert snapshot.num_scheduled_tokens == 2
+    assert snapshot.num_physical_tokens == 4
+    assert torch.equal(snapshot.modular_routing_data, routing_data)
 
 
 def test_routed_experts_capturer_single_dp_no_metadata():
